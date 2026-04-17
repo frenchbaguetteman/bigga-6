@@ -3,6 +3,14 @@
 Developer-only utilities for the `bigga-6` project. Nothing in here is
 compiled into firmware; the scripts run on a host machine with Python 3.
 
+> **Build isolation.** The PROS build only compiles sources under `src/`
+> (see `SRCDIR` in `Makefile` and the `CSRC`/`CXXSRC` rules in
+> `common.mk`), and the template export only ships specific headers from
+> `include/`. Files under `tools/` are therefore ignored by `pros make`
+> and `pros upload` and cannot affect the robot binary. Please keep this
+> property: do not place any `.c`, `.cpp`, `.cc`, `.c++`, `.s`, or `.S`
+> files in this directory.
+
 ---
 
 ## `ltv_sim.py` — LTV controller convergence regression test
