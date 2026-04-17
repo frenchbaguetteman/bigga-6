@@ -8,17 +8,54 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #include "EZ-Template/util.hpp"
 #include "controllers/ltv_controller.hpp"
 #include "controllers/ramsete_controller.hpp"
-#include "robot_config.hpp"
 #include "pros/misc.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 using namespace ez;
 
 namespace {
 
 constexpr double kMaxDriveMillivolts = 12000.0;
+constexpr double kInToM             = 0.0254;
+constexpr double kTrackWidthIn      = 11.40;
+constexpr double kMaxSpeedInps      = 76.576321;
+constexpr double kVelMeasAlpha      = 0.35;
+constexpr double kVelKp             = 1300.0;
+constexpr double kVelKd             = 0.0;
+constexpr double kVelMaxCorrectionMv = 2500.0;
+constexpr std::uint32_t kOdomTraceFlushPeriod = 25;
+constexpr float  kFfKs              = 1100.0f;
+constexpr float  kFfKv              = 6200.0f;
+constexpr float  kFfKa              = 400.0f;
+constexpr float  kRadToDeg          = 180.0f / 3.14159265f;
+constexpr double kDegToRad          = 3.14159265358979323846 / 180.0;
+
+// --- LTV final-pose settler tuning V2 (verified in tools/sim/ltv_sim.py) ---
+// Voltage-domain turn-drive-turn recovery with:
+//   * Locked phase-1 heading (prevents bearing-chase spinning)
+//   * Angular-rate damping (Kd term)
+//   * Moderate max voltage (4 V, not 6 V)
+//   * Wider phase-1→2 transition (10°, not 2°)
+//   * Min kick gated on omega (prevents boost during deceleration)
+constexpr double kSettleKpHdgMvPerRad       = 12000.0;
+constexpr double kSettleKdMvPerRadps        = 500.0;
+constexpr double kSettleKpFwdMvPerIn        = 900.0;
+constexpr double kSettleMinTurnKickMv       = 1400.0;
+constexpr double kSettleOmegaKickThreshDeg  = 15.0;  // min kick only when |omega| < this
+constexpr double kSettleMaxTurnMv           = 4000.0;
+constexpr double kSettleMaxFwdMv            = 2500.0;
+constexpr double kSettleFwdMinMv            = 1500.0;
+constexpr double kSettleHdgDeadbandDeg      = 0.3;
+constexpr double kSettleApproachXyTriggerIn = 1.0;
+constexpr double kSettlePhase1TolDeg        = 10.0;
+constexpr double kSettleXyTolIn             = 0.75;
+constexpr double kSettleAngTolDeg           = 1.2;
+constexpr double kSettleStableS             = 0.15;
+constexpr double kSettleMaxS                = 5.0;
+constexpr double kSettleHoldS               = 0.05;
 
 struct TrackingControllerResult {
   double linear_inps = 0.0;
@@ -51,8 +88,8 @@ double clamp_symmetric(double value, double limit) {
 std::pair<double, double> limit_wheel_speeds(double left_inps,
                                              double right_inps) {
   const double max_scale = std::max(
-      {1.0, std::fabs(left_inps) / RobotConfig::MAX_SPEED_INPS,
-       std::fabs(right_inps) / RobotConfig::MAX_SPEED_INPS});
+      {1.0, std::fabs(left_inps) / kMaxSpeedInps,
+       std::fabs(right_inps) / kMaxSpeedInps});
   return {left_inps / max_scale, right_inps / max_scale};
 }
 
@@ -80,22 +117,60 @@ double motor_rpm_to_wheel_inps(double motor_rpm, double wheel_diameter_in,
 }
 
 WheelVelocityState limit_tracking_wheel_speeds(
-    TrackingControllerResult& controller_result) {
-  const double half_track = RobotConfig::TRACK_WIDTH_IN / 2.0;
+    const TrackingControllerResult& controller_result) {
+  const double half_track = kTrackWidthIn / 2.0;
   auto [left_inps, right_inps] = limit_wheel_speeds(
       controller_result.linear_inps + (controller_result.angular_radps * half_track),
       controller_result.linear_inps - (controller_result.angular_radps * half_track));
-
-  controller_result.linear_inps = (left_inps + right_inps) / 2.0;
-  controller_result.angular_radps =
-      (left_inps - right_inps) / RobotConfig::TRACK_WIDTH_IN;
   return {left_inps, right_inps};
+}
+
+const char* odom_feedback_name(e_odom_feedback feedback) {
+  switch (feedback) {
+    case LTV_FEEDBACK:
+      return "LTV";
+    case RAMSETE_FEEDBACK:
+      return "RAMSETE";
+    case PID_FEEDBACK:
+    default:
+      return "PID";
+  }
+}
+
+const char* odom_mode_name(e_mode mode) {
+  switch (mode) {
+    case PURE_PURSUIT:
+      return "PURE_PURSUIT";
+    case POINT_TO_POINT:
+      return "POINT_TO_POINT";
+    default:
+      return "OTHER";
+  }
+}
+
+const char* drive_direction_name(drive_directions direction) {
+  return direction == REV ? "REV" : "FWD";
+}
+
+double trace_nan() {
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+ltv::Pose2d make_ltv_pose(double ez_x, double ez_y, double ez_theta_deg) {
+  return {ez_y, -ez_x, -ez_theta_deg * kDegToRad};
 }
 
 }  // namespace
 
 // File-scoped controller instances shared by all odom tasks.
-static LtvController     s_ltv;
+// Q/R tuned for VEX: state tolerances in inches/radians, control effort in
+// in/s and rad/s. maxVelocity just above physical max (kMaxSpeedInps ≈ 76.58)
+// to keep the gain table compact without clipping.
+static LTVUnicycleController s_ltv{
+    {0.5, 0.5, 0.1},
+    {20.0, 2.0},
+    util::DELAY_TIME / 1000.0,
+    100.0};
 static RamseteController s_ramsete;
 static int s_ctrl_log_counter = 0;
 
@@ -321,6 +396,173 @@ void Drive::odom_reference_task() {
 
   const odom_reference_state ref = sample_odom_reference_state();
   const pose current = odom_pose_get();
+
+  // --- LTV final-pose settler V2 (damped turn-drive-turn) -----------------
+  // After the reference trajectory time elapses, the standard LTV+FF
+  // pipeline produces commands inside the drivetrain's static-friction
+  // deadband near zero velocity.  Engage a voltage-domain controller with:
+  //   * Angular-rate damping (Kd) to prevent overshooting turns
+  //   * Locked phase-1 heading to prevent bearing-chase spinning
+  //   * Moderate max voltage (4 V) to keep angular momentum manageable
+  //   * Min kick gated on omega to allow proper deceleration
+  if (odom_feedback_type == LTV_FEEDBACK && !odom_reference_states.empty()) {
+    const double total_time_s = odom_reference_states.back().time;
+    const double elapsed_s =
+        (pros::millis() - odom_reference_start_ms) / 1000.0;
+
+    if (elapsed_s >= total_time_s + kSettleHoldS) {
+      if (!odom_settle_active) {
+        odom_settle_active = true;
+        odom_settle_phase = 0;
+        odom_settle_start_ms = pros::millis();
+        odom_settle_stable_accum_s = 0.0;
+        odom_settle_final_target_theta_deg =
+            odom_reference_states.back().target_pose.theta;
+        odom_settle_locked_bearing_deg = 0.0;
+        odom_settle_prev_theta_deg = current.theta;
+      }
+
+      const pose final_target = odom_reference_states.back().target_pose;
+      const double dx = final_target.x - current.x;
+      const double dy = final_target.y - current.y;
+      const double xy_err_in = std::hypot(dx, dy);
+      // EZ convention: heading 0°=+Y, CW+, so atan2(dx, dy)
+      const double angle_to_target_deg =
+          util::wrap_angle(std::atan2(dx, dy) * kRadToDeg);
+      const double hdg_err_final_deg =
+          util::wrap_angle(odom_settle_final_target_theta_deg - current.theta);
+
+      // Angular rate estimation (deg/s)
+      const double omega_degps =
+          util::wrap_angle(current.theta - odom_settle_prev_theta_deg) /
+          (util::DELAY_TIME / 1000.0);
+
+      // --- Phase transitions ---
+      // Phase 0 → 1: heading aligned to final, xy still large
+      if (odom_settle_phase == 0 &&
+          std::fabs(hdg_err_final_deg) < kSettleAngTolDeg * 1.5 &&
+          xy_err_in > kSettleApproachXyTriggerIn) {
+        odom_settle_phase = 1;
+        odom_settle_locked_bearing_deg = angle_to_target_deg;
+      }
+
+      // Phase 1 → 2: heading within tolerance of LOCKED bearing
+      if (odom_settle_phase == 1) {
+        const double err_to_locked =
+            util::wrap_angle(odom_settle_locked_bearing_deg - current.theta);
+        if (std::fabs(err_to_locked) < kSettlePhase1TolDeg) {
+          odom_settle_phase = 2;
+        }
+      } else if (odom_settle_phase == 2) {
+        if (xy_err_in < 0.5) {
+          odom_settle_phase = 3;
+        }
+      } else if (odom_settle_phase == 3) {
+        if (std::fabs(hdg_err_final_deg) < kSettleAngTolDeg) {
+          odom_settle_phase = 4;
+        }
+      }
+
+      // Select target heading and forward flag.
+      double drive_heading_deg;
+      bool want_drive_forward;
+      if (odom_settle_phase == 1) {
+        drive_heading_deg = odom_settle_locked_bearing_deg;  // LOCKED
+        want_drive_forward = false;
+      } else if (odom_settle_phase == 2) {
+        drive_heading_deg = angle_to_target_deg;  // live bearing OK when close
+        want_drive_forward = true;
+      } else {
+        drive_heading_deg = odom_settle_final_target_theta_deg;
+        want_drive_forward = false;
+      }
+
+      // --- P + D heading controller ---
+      const double err_hdg_drive_deg =
+          util::wrap_angle(drive_heading_deg - current.theta);
+      const double err_hdg_drive_rad = err_hdg_drive_deg * kDegToRad;
+      const double omega_radps = omega_degps * kDegToRad;
+
+      // P term
+      double v_p = kSettleKpHdgMvPerRad * err_hdg_drive_rad;
+      // D term (angular rate damping — always active)
+      const double v_d = -kSettleKdMvPerRadps * omega_radps;
+
+      // Static friction kick: only when nearly stationary (prevents boosting
+      // during deceleration which caused the V1 spinning)
+      if (std::fabs(err_hdg_drive_deg) > kSettleHdgDeadbandDeg &&
+          std::fabs(omega_degps) < kSettleOmegaKickThreshDeg) {
+        if (std::fabs(v_p) < kSettleMinTurnKickMv) {
+          v_p = std::copysign(kSettleMinTurnKickMv, v_p);
+        }
+      } else if (std::fabs(err_hdg_drive_deg) <= kSettleHdgDeadbandDeg) {
+        v_p = 0.0;  // deadband suppresses P
+      }
+
+      double v_turn_mv = clamp_symmetric(v_p + v_d, kSettleMaxTurnMv);
+
+      // Forward drive (only in phase 2, when heading is roughly aligned)
+      double v_fwd_mv = 0.0;
+      if (want_drive_forward && std::fabs(err_hdg_drive_deg) < 20.0) {
+        v_fwd_mv = kSettleKpFwdMvPerIn * xy_err_in;
+        v_fwd_mv = std::copysign(
+            std::max(std::fabs(v_fwd_mv), kSettleFwdMinMv), 1.0);
+        v_fwd_mv = std::min(v_fwd_mv, kSettleMaxFwdMv);
+      }
+
+      // Stability accumulator
+      const double dt_s = util::DELAY_TIME / 1000.0;
+      if (xy_err_in < kSettleXyTolIn &&
+          std::fabs(hdg_err_final_deg) < kSettleAngTolDeg) {
+        odom_settle_stable_accum_s += dt_s;
+      } else {
+        odom_settle_stable_accum_s = 0.0;
+      }
+
+      const double settle_elapsed_s =
+          (pros::millis() - odom_settle_start_ms) / 1000.0;
+      const bool settle_done =
+          odom_settle_stable_accum_s >= kSettleStableS ||
+          settle_elapsed_s >= kSettleMaxS;
+
+      double left_out_mv = v_fwd_mv + v_turn_mv;
+      double right_out_mv = v_fwd_mv - v_turn_mv;
+      if (settle_done) {
+        left_out_mv = 0.0;
+        right_out_mv = 0.0;
+        odom_settle_phase = 4;
+      }
+
+      const int left_cmd = millivolts_to_drive_command(left_out_mv);
+      const int right_cmd = millivolts_to_drive_command(right_out_mv);
+
+      if (print_toggle && s_ctrl_log_counter++ % 10 == 0) {
+        printf(
+            "  LTV-settle ph:%d cur:(%.2f, %.2f, %.1f) tgt:(%.2f, %.2f, %.1f) "
+            "xy:%.3f hdg:%.2f w:%.1f mv:(L %.0f, R %.0f) stable:%.2fs%s\n",
+            odom_settle_phase, current.x, current.y, current.theta,
+            final_target.x, final_target.y,
+            odom_settle_final_target_theta_deg, xy_err_in, hdg_err_final_deg,
+            omega_degps, left_out_mv, right_out_mv,
+            odom_settle_stable_accum_s, settle_done ? " DONE" : "");
+      }
+
+      current_drive_direction = ref.drive_direction;
+      odom_target = final_target;
+      odom_settle_prev_theta_deg = current.theta;
+      odom_reference_last_ms = pros::millis();
+
+      if (drive_toggle) {
+        private_drive_set(left_cmd, right_cmd);
+      }
+
+      leftPID.compute(drive_sensor_left());
+      rightPID.compute(drive_sensor_right());
+      return;
+    }
+  }
+  // ------------------------------------------------------------------------
+
   const double avg_progress =
       ((drive_sensor_left() - l_start) + (drive_sensor_right() - r_start)) /
       2.0;
@@ -336,6 +578,25 @@ void Drive::odom_reference_task() {
   current_a_odomPID.compute_error(heading_error, odom_theta_get());
 
   const auto calculate_tracking_command = [&]() {
+    TrackingControllerResult result;
+    if (odom_feedback_type == LTV_FEEDBACK) {
+      const auto current_pose = make_ltv_pose(current.x, current.y, current.theta);
+      const auto ref_pose =
+          make_ltv_pose(ref.target_pose.x, ref.target_pose.y, ref.target_pose.theta);
+      // make_ltv_pose() flips to LTV's CCW-positive convention; angular
+      // velocity and omega output must be flipped to match.
+      const auto cmd = s_ltv.Calculate(current_pose, ref_pose, ref.linear_velocity,
+                                       -ref.angular_velocity);
+      const auto& pose_error = s_ltv.PoseError();
+
+      result.err_fwd = static_cast<float>(pose_error.X());
+      result.err_lat = static_cast<float>(-pose_error.Y());
+      result.err_hdg = static_cast<float>(-pose_error.Rotation().Radians());
+      result.linear_inps = cmd.vx;
+      result.angular_radps = -cmd.omega;
+      return result;
+    }
+
     const float cx = static_cast<float>(current.x);
     const float cy = static_cast<float>(current.y);
     const float ct = static_cast<float>(current.theta);
@@ -344,21 +605,7 @@ void Drive::odom_reference_task() {
     const float tt = static_cast<float>(ref.target_pose.theta);
     const float v_ref = static_cast<float>(ref.linear_velocity);
     const float omega_ref_deg =
-        static_cast<float>(ref.angular_velocity * RobotConfig::RAD_TO_DEG);
-
-    TrackingControllerResult result;
-    if (odom_feedback_type == LTV_FEEDBACK) {
-      const auto cmd = s_ltv.calculateChassisSpeeds(cx, cy, ct, tx, ty, tt,
-                                                    v_ref, omega_ref_deg);
-      const auto& e = s_ltv.lastError();
-      result.err_fwd = e[0];
-      result.err_lat = e[1];
-      result.err_hdg = e[2];
-      result.linear_inps = cmd.linear;
-      result.angular_radps = cmd.angular;
-      return result;
-    }
-
+        static_cast<float>(ref.angular_velocity * kRadToDeg);
     const auto cmd = s_ramsete.calculateChassisSpeeds(cx, cy, ct, tx, ty, tt,
                                                       v_ref, omega_ref_deg);
     result.err_fwd = s_ramsete.lastEx();
@@ -381,7 +628,7 @@ void Drive::odom_reference_task() {
 
     if (odom_reference_feedback_valid && now_ms > odom_reference_last_ms) {
       dt_s = std::max(1e-3, (now_ms - odom_reference_last_ms) / 1000.0);
-      constexpr double kAlpha = RobotConfig::TRACKING_VEL_MEAS_ALPHA;
+      constexpr double kAlpha = kVelMeasAlpha;
       odom_reference_left_vel =
           (kAlpha * raw.left_inps) + ((1.0 - kAlpha) * odom_reference_left_vel);
       odom_reference_right_vel =
@@ -408,22 +655,27 @@ void Drive::odom_reference_task() {
                   dt_s
             : ref.angular_acceleration;
 
-    const auto [ff_left_mv, ff_right_mv] =
-        RobotConfig::drivetrainFeedforward_mV(
-            static_cast<float>(controller_result.linear_inps *
-                               RobotConfig::IN_TO_M),
-            static_cast<float>(controller_result.angular_radps),
-            static_cast<float>(cmd_linear_accel * RobotConfig::IN_TO_M),
-            static_cast<float>(cmd_angular_accel));
+    // Inline drivetrain feedforward
+    auto ffOneSide = [](float vel, float acc) -> float {
+      const float sign = (vel > 0.0f) ? 1.0f : ((vel < 0.0f) ? -1.0f : 0.0f);
+      return kFfKs * sign + kFfKv * vel + kFfKa * acc;
+    };
+    const float halfTrackM = static_cast<float>(kTrackWidthIn * kInToM) / 2.0f;
+    const float vMps   = static_cast<float>(controller_result.linear_inps * kInToM);
+    const float omRad  = static_cast<float>(controller_result.angular_radps);
+    const float aMps2  = static_cast<float>(cmd_linear_accel * kInToM);
+    const float alRad2 = static_cast<float>(cmd_angular_accel);
+    const float ff_left_mv  = ffOneSide(vMps + omRad * halfTrackM, aMps2 + alRad2 * halfTrackM);
+    const float ff_right_mv = ffOneSide(vMps - omRad * halfTrackM, aMps2 - alRad2 * halfTrackM);
 
     const double desired_left_mps =
-        desired_wheels.left_inps * RobotConfig::IN_TO_M;
+        desired_wheels.left_inps * kInToM;
     const double desired_right_mps =
-        desired_wheels.right_inps * RobotConfig::IN_TO_M;
+        desired_wheels.right_inps * kInToM;
     const double measured_left_mps =
-        measured_wheels.left_inps * RobotConfig::IN_TO_M;
+        measured_wheels.left_inps * kInToM;
     const double measured_right_mps =
-        measured_wheels.right_inps * RobotConfig::IN_TO_M;
+        measured_wheels.right_inps * kInToM;
 
     TrackingVoltageCommand result;
     result.left_vel_error_mps = desired_left_mps - measured_left_mps;
@@ -441,13 +693,13 @@ void Drive::odom_reference_task() {
     result.ff_left_mv = ff_left_mv;
     result.ff_right_mv = ff_right_mv;
     result.fb_left_mv = clamp_symmetric(
-        (RobotConfig::TRACKING_VEL_KP_MV_PER_MPS * result.left_vel_error_mps) +
-            (RobotConfig::TRACKING_VEL_KD_MV_PER_MPS2 * left_error_rate),
-        RobotConfig::TRACKING_VEL_MAX_CORRECTION_MV);
+        (kVelKp * result.left_vel_error_mps) +
+            (kVelKd * left_error_rate),
+        kVelMaxCorrectionMv);
     result.fb_right_mv = clamp_symmetric(
-        (RobotConfig::TRACKING_VEL_KP_MV_PER_MPS * result.right_vel_error_mps) +
-            (RobotConfig::TRACKING_VEL_KD_MV_PER_MPS2 * right_error_rate),
-        RobotConfig::TRACKING_VEL_MAX_CORRECTION_MV);
+        (kVelKp * result.right_vel_error_mps) +
+            (kVelKd * right_error_rate),
+        kVelMaxCorrectionMv);
 
     const double left_out_mv = clamp_symmetric(
         result.ff_left_mv + result.fb_left_mv, kMaxDriveMillivolts);
@@ -459,23 +711,75 @@ void Drive::odom_reference_task() {
   };
 
   auto controller_result = calculate_tracking_command();
-  const auto desired_wheels = limit_tracking_wheel_speeds(controller_result);
-
   const std::uint32_t now_ms = pros::millis();
+  auto limited_controller_result = controller_result;
+  const auto desired_wheels = limit_tracking_wheel_speeds(limited_controller_result);
+
   double dt_s = util::DELAY_TIME / 1000.0;
   const auto measured_wheels = update_filtered_wheel_velocity_state(now_ms, dt_s);
   const auto voltage_command = calculate_tracking_voltage_command(
-      controller_result, desired_wheels, measured_wheels, dt_s);
+      limited_controller_result, desired_wheels, measured_wheels, dt_s);
 
-  odom_reference_prev_cmd_v = controller_result.linear_inps;
-  odom_reference_prev_cmd_omega = controller_result.angular_radps;
+  odom_reference_prev_cmd_v = limited_controller_result.linear_inps;
+  odom_reference_prev_cmd_omega = limited_controller_result.angular_radps;
   odom_reference_prev_left_err = voltage_command.left_vel_error_mps;
   odom_reference_prev_right_err = voltage_command.right_vel_error_mps;
   odom_reference_last_ms = now_ms;
   odom_reference_feedback_valid = true;
 
+  const char* controller_tag = odom_feedback_name(odom_feedback_type);
+  const char* mode_tag = odom_mode_name(mode);
+  const char* direction_tag = drive_direction_name(ref.drive_direction);
+  const double trace_elapsed_s =
+      (now_ms - odom_reference_start_ms) / 1000.0;
+  const double nan = trace_nan();
+
+  double ramsete_k = nan;
+  double ramsete_sinc = nan;
+  double ltv_k00 = nan;
+  double ltv_k01 = nan;
+  double ltv_k02 = nan;
+  double ltv_k10 = nan;
+  double ltv_k11 = nan;
+  double ltv_k12 = nan;
+  double ltv_corr_v = nan;
+  double ltv_corr_omega = nan;
+
+  if (odom_feedback_type != LTV_FEEDBACK) {
+    ramsete_k = s_ramsete.lastK();
+    ramsete_sinc = s_ramsete.lastSinc();
+  }
+
+  if (odom_trace_file != nullptr) {
+    std::fprintf(
+        odom_trace_file,
+        "TRACE,%u,%u,%s,%s,%s,%u,%.6f,%d,%zu,"
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d\n",
+        odom_trace_session_id, odom_trace_segment_id, controller_tag,
+        mode_tag, direction_tag, now_ms, trace_elapsed_s, -1,
+        odom_reference_states.size(), current.x, current.y, current.theta,
+        ref.target_pose.x, ref.target_pose.y, ref.target_pose.theta, ref.time,
+        ref.distance, ref.linear_velocity, ref.angular_velocity,
+        ref.linear_acceleration, ref.angular_acceleration, ref.curvature,
+        translation_error, heading_error, controller_result.err_fwd,
+        controller_result.err_lat, controller_result.err_hdg,
+        controller_result.linear_inps, controller_result.angular_radps,
+        ramsete_k, ramsete_sinc, ltv_k00, ltv_k01, ltv_k02, ltv_k10, ltv_k11,
+        ltv_k12, ltv_corr_v, ltv_corr_omega, desired_wheels.left_inps,
+        desired_wheels.right_inps, measured_wheels.left_inps,
+        measured_wheels.right_inps, voltage_command.ff_left_mv,
+        voltage_command.ff_right_mv, voltage_command.fb_left_mv,
+        voltage_command.fb_right_mv, voltage_command.left_cmd,
+        voltage_command.right_cmd);
+
+    if (++odom_trace_rows_since_flush % kOdomTraceFlushPeriod == 0) {
+      std::fflush(odom_trace_file);
+    }
+  }
+
   if (print_toggle && s_ctrl_log_counter++ % 10 == 0) {
-    const char* tag = (odom_feedback_type == LTV_FEEDBACK) ? "LTV" : "RAMSETE";
     const float cx = static_cast<float>(current.x);
     const float cy = static_cast<float>(current.y);
     const float ct = static_cast<float>(current.theta);
@@ -483,21 +787,42 @@ void Drive::odom_reference_task() {
     const float ty = static_cast<float>(ref.target_pose.y);
     const float tt = static_cast<float>(ref.target_pose.theta);
     const float v_ref = static_cast<float>(ref.linear_velocity);
-    printf(
-        "  %s cur:(%.2f, %.2f, %.1f) ref:(%.2f, %.2f, %.1f) "
-        "t:%.2f s:%.2f vRef:%.2f wRef:%.4f k:%.4f "
-        "err:(fwd %.3f, lat %.3f, hdg %.4f) v:%.2f w:%.4f "
-        "wheel:(des %.2f/%.2f, meas %.2f/%.2f) mv:(ff %.0f/%.0f, fb %.0f/%.0f) cmd:(%d, %d)\n",
-        tag, cx, cy, ct, tx, ty, tt, ref.time, ref.distance, v_ref,
-        static_cast<float>(ref.angular_velocity), static_cast<float>(ref.curvature),
-        controller_result.err_fwd, controller_result.err_lat,
-        controller_result.err_hdg, controller_result.linear_inps,
-        controller_result.angular_radps, desired_wheels.left_inps,
-        desired_wheels.right_inps, measured_wheels.left_inps,
-        measured_wheels.right_inps, voltage_command.ff_left_mv,
-        voltage_command.ff_right_mv, voltage_command.fb_left_mv,
-        voltage_command.fb_right_mv, voltage_command.left_cmd,
-        voltage_command.right_cmd);
+    if (odom_feedback_type == LTV_FEEDBACK) {
+      printf(
+          "  %s cur:(%.2f, %.2f, %.1f) ref:(%.2f, %.2f, %.1f) "
+          "t:%.2f s:%.2f curv:%.4f vRef:%.2f wRef:%.4f "
+          "err:(fwd %.3f, lat %.3f, hdg %.4f) cmd:(v %.2f, w %.4f) "
+          "wheel:(des %.2f/%.2f, meas %.2f/%.2f) "
+          "mv:(ff %.0f/%.0f, fb %.0f/%.0f) cmd:(%d, %d)\n",
+          controller_tag, cx, cy, ct, tx, ty, tt, ref.time, ref.distance,
+          static_cast<float>(ref.curvature), v_ref,
+          static_cast<float>(ref.angular_velocity), controller_result.err_fwd,
+          controller_result.err_lat, controller_result.err_hdg,
+          controller_result.linear_inps, controller_result.angular_radps,
+          desired_wheels.left_inps, desired_wheels.right_inps,
+          measured_wheels.left_inps, measured_wheels.right_inps,
+          voltage_command.ff_left_mv, voltage_command.ff_right_mv,
+          voltage_command.fb_left_mv, voltage_command.fb_right_mv,
+          voltage_command.left_cmd, voltage_command.right_cmd);
+    } else {
+      printf(
+          "  %s cur:(%.2f, %.2f, %.1f) ref:(%.2f, %.2f, %.1f) "
+          "t:%.2f s:%.2f curv:%.4f vRef:%.2f wRef:%.4f "
+          "err:(fwd %.3f, lat %.3f, hdg %.4f) cmd:(v %.2f, w %.4f) "
+          "ram:(k %.4f, sinc %.4f) wheel:(des %.2f/%.2f, meas %.2f/%.2f) "
+          "mv:(ff %.0f/%.0f, fb %.0f/%.0f) cmd:(%d, %d)\n",
+          controller_tag, cx, cy, ct, tx, ty, tt, ref.time, ref.distance,
+          static_cast<float>(ref.curvature), v_ref,
+          static_cast<float>(ref.angular_velocity), controller_result.err_fwd,
+          controller_result.err_lat, controller_result.err_hdg,
+          controller_result.linear_inps, controller_result.angular_radps,
+          static_cast<float>(ramsete_k), static_cast<float>(ramsete_sinc),
+          desired_wheels.left_inps, desired_wheels.right_inps,
+          measured_wheels.left_inps, measured_wheels.right_inps,
+          voltage_command.ff_left_mv, voltage_command.ff_right_mv,
+          voltage_command.fb_left_mv, voltage_command.fb_right_mv,
+          voltage_command.left_cmd, voltage_command.right_cmd);
+    }
   }
 
   if (drive_toggle) {

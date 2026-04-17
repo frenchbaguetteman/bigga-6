@@ -13,6 +13,8 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #include "pros/llemu.hpp"
 #include "util.hpp"
 
+#include <cstdlib>
+
 namespace ez::as {
 AutonSelector auton_selector{};
 
@@ -34,9 +36,10 @@ void auton_selector_initialize() {
   FILE* as_usd_file_read;
   // If file exists...
   if ((as_usd_file_read = fopen("/usd/auto.txt", "r"))) {
-    char a_buf[10];
-    fread(a_buf, 1, 10, as_usd_file_read);
-    ez::as::auton_selector.auton_page_current = std::stof(a_buf);
+    char a_buf[10] = {};
+    const size_t bytes_read = fread(a_buf, 1, sizeof(a_buf) - 1, as_usd_file_read);
+    a_buf[bytes_read] = '\0';
+    ez::as::auton_selector.auton_page_current = static_cast<int>(std::strtol(a_buf, nullptr, 10));
     fclose(as_usd_file_read);
   }
   // If file doesn't exist, create file

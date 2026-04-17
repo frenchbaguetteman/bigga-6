@@ -118,6 +118,10 @@ void Drive::pid_odom_set(odom imovement) {
   pid_odom_set(imovement, slew_on);
 }
 void Drive::pid_odom_set(odom imovement, bool slew_on) {
+  if (odom_feedback_get() == LTV_FEEDBACK) {
+    pid_odom_set(std::vector<odom>{imovement}, slew_on);
+    return;
+  }
   if (imovement.target.theta != ANGLE_NOT_SET)
     pid_odom_boomerang_set(imovement, slew_on);
   else
@@ -132,6 +136,26 @@ void Drive::pid_odom_set(std::vector<odom> imovements) {
   pid_odom_set(imovements, slew_on);
 }
 void Drive::pid_odom_set(std::vector<odom> imovements, bool slew_on) {
+  if (odom_feedback_get() != PID_FEEDBACK) {
+    xyPID.timers_reset();
+    current_a_odomPID.timers_reset();
+
+    std::vector<odom> input_path = set_odoms_direction(imovements);
+    injected_pp_index.clear();
+    for (int i = 0; i < static_cast<int>(input_path.size()); ++i) {
+      injected_pp_index.push_back(i);
+    }
+
+    odom_turn_bias_enable(true);
+    current_slew_on = slew_on;
+    slew_min_when_it_enabled = 0;
+    slew_will_enable_later = false;
+
+    if (print_toggle) printf("Reference Path ");
+    raw_pid_odom_pp_set(input_path, slew_on);
+    return;
+  }
+
   pid_odom_injected_pp_set(imovements, slew_on);
 }
 // Units

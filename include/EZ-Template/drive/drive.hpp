@@ -7,6 +7,7 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #pragma once
 
 #include <functional>
+#include <cstdio>
 #include <iostream>
 #include <tuple>
 
@@ -3461,6 +3462,23 @@ class Drive {
   double odom_reference_prev_left_err = 0.0;
   double odom_reference_prev_right_err = 0.0;
   bool odom_reference_feedback_valid = false;
+  // LTV final-pose settler state (engaged after trajectory time elapses).
+  // Runs a voltage-domain turn-drive-turn recovery to bring residual xy/
+  // heading error below the user spec. Phases:
+  //   0 idle / hold, 1 turn-to-target, 2 drive forward, 3 turn-to-final, 4 done
+  bool odom_settle_active = false;
+  int odom_settle_phase = 0;
+  std::uint32_t odom_settle_start_ms = 0;
+  double odom_settle_stable_accum_s = 0.0;
+  double odom_settle_final_target_theta_deg = 0.0;
+  double odom_settle_locked_bearing_deg = 0.0;
+  double odom_settle_prev_theta_deg = 0.0;
+  std::FILE* odom_trace_file = nullptr;
+  std::uint32_t odom_trace_session_id = 0;
+  std::uint32_t odom_trace_segment_id = 0;
+  std::uint32_t odom_trace_rows_since_flush = 0;
+  bool odom_trace_session_active = false;
+  bool odom_trace_warning_printed = false;
   std::vector<int> injected_pp_index;
   int pp_index = 0;
   std::vector<odom> smooth_path(std::vector<odom> ipath, double weight_smooth, double weight_data, double tolerance);
@@ -3469,6 +3487,9 @@ class Drive {
   void build_odom_reference_states(const std::vector<odom>& imovements, pose start_pose);
   void rebuild_odom_reference_for_current_motion();
   odom_reference_state sample_odom_reference_state() const;
+  void begin_odom_reference_trace_segment(pose start_pose, std::size_t movement_count,
+                                          std::size_t state_count);
+  void end_odom_reference_trace(const char* reason = nullptr);
   void raw_pid_odom_pp_set(std::vector<odom> imovements, bool slew_on);
   bool ptf1_running = false;
   std::vector<pose> find_point_to_face(pose current, pose target, drive_directions dir, bool set_global);

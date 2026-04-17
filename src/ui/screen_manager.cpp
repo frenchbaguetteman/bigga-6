@@ -31,6 +31,8 @@ static Page s_page     = Page::SELECT;
 static Page s_pagePrev = Page::SELECT;
 static bool s_dirty    = true;
 static uint32_t s_lastTouch = 0;
+static ViewModel s_lastRenderedVm{};
+static bool s_hasLastRenderedVm = false;
 
 // ── Category filter state ────────────────────────────────────────────────────
 enum class CatFilter { ALL, MATCH, SKILLS, TEST };
@@ -129,6 +131,30 @@ double wrapDeg(double angle) {
     while (angle > 180.0)   angle -= 360.0;
     while (angle <= -180.0) angle += 360.0;
     return angle;
+}
+
+int quantizeTenths(float value) {
+    return static_cast<int>(std::lround(value * 10.0f));
+}
+
+int quantizeWhole(float value) {
+    return static_cast<int>(std::lround(value));
+}
+
+bool sameViewModel(const ViewModel& lhs, const ViewModel& rhs) {
+    return quantizeTenths(lhs.odomX) == quantizeTenths(rhs.odomX) &&
+           quantizeTenths(lhs.odomY) == quantizeTenths(rhs.odomY) &&
+           quantizeTenths(lhs.odomTheta) == quantizeTenths(rhs.odomTheta) &&
+           std::strncmp(lhs.autonName, rhs.autonName, sizeof(lhs.autonName)) == 0 &&
+           lhs.autonIndex == rhs.autonIndex &&
+           lhs.autonCount == rhs.autonCount &&
+           quantizeWhole(lhs.batteryPct) == quantizeWhole(rhs.batteryPct) &&
+           quantizeTenths(lhs.batteryVolts) == quantizeTenths(rhs.batteryVolts) &&
+           quantizeWhole(lhs.motorTempMax) == quantizeWhole(rhs.motorTempMax) &&
+           std::strncmp(lhs.hotMotor, rhs.hotMotor, sizeof(lhs.hotMotor)) == 0 &&
+           std::strncmp(lhs.status, rhs.status, sizeof(lhs.status)) == 0 &&
+           lhs.compConnected == rhs.compConnected &&
+           lhs.imuCalibrated == rhs.imuCalibrated;
 }
 
 DisplayPose toDisplayPose(float absX, float absY, float absTheta) {
@@ -255,6 +281,7 @@ void handleTouch() {
             s_relativeOriginY     = s_lastAbsY;
             s_relativeOriginTheta = s_lastAbsTheta;
             FieldDisplay::clearTrail();
+            s_dirty = true;
             return;
         }
     }
@@ -263,7 +290,7 @@ void handleTouch() {
 // ── Draw helpers ─────────────────────────────────────────────────────────────
 
 void drawTabs(Page active) {
-    UITheme::text(pros::E_TEXT_SMALL, 8, 6, UITheme::kWhite, UITheme::kBgHeader, "BIGGA 5");
+    UITheme::text(pros::E_TEXT_SMALL, 8, 6, UITheme::kWhite, UITheme::kBgHeader, "BIGGA 6");
     UITheme::drawBtn(TAB_SELECT, "SELECT", active == Page::SELECT);
     UITheme::drawBtn(TAB_INFO,   "INFO",   active == Page::INFO);
 }
@@ -384,7 +411,7 @@ void drawSelectPage(const ViewModel& vm) {
     UITheme::fill(UITheme::makeRect(336, 138, 130, 80), UITheme::kBg);
     UITheme::text(pros::E_TEXT_SMALL, 336, 138, UITheme::kDimGray, UITheme::kBg, "SELECTED");
     UITheme::text(pros::E_TEXT_MEDIUM, 336, 156, UITheme::kWhite, UITheme::kBg,
-                  "%.14s", vm.autonName.c_str());
+                  "%.14s", vm.autonName);
 
     // Category badge for selected auton
     if (current >= 0 && current < static_cast<int>(s_entries.size())) {
@@ -404,7 +431,7 @@ void drawSelectPage(const ViewModel& vm) {
     UITheme::fill(UITheme::makeRect(0, UITheme::kScreenH - 15, UITheme::kScreenW, 15),
                   UITheme::kBgAlt);
     UITheme::text(pros::E_TEXT_SMALL, 8, UITheme::kScreenH - 12,
-                  UITheme::kDimGray, UITheme::kBgAlt, "%.46s", vm.status.c_str());
+                  UITheme::kDimGray, UITheme::kBgAlt, "%.46s", vm.status);
 
     // Battery in bottom-right
     char batBuf[24];
@@ -488,9 +515,9 @@ void drawInfoPage(const ViewModel& vm) {
     std::snprintf(tempBuf, sizeof(tempBuf), "%.0f C", vm.motorTempMax);
     UITheme::text(pros::E_TEXT_SMALL,  COL_X,      yy,     UITheme::kDimGray,  UITheme::kBg, "TEMP");
     UITheme::text(pros::E_TEXT_MEDIUM, COL_X + 40, yy - 2, tempCol,            UITheme::kBg, "%s", tempBuf);
-    if (!vm.hotMotor.empty()) {
+    if (vm.hotMotor[0] != '\0') {
         UITheme::text(pros::E_TEXT_SMALL, COL_X + 120, yy, UITheme::kDarkGray, UITheme::kBg,
-                      "(%s)", vm.hotMotor.c_str());
+                      "(%s)", vm.hotMotor);
     }
     yy += 22;
 
@@ -519,7 +546,7 @@ void drawInfoPage(const ViewModel& vm) {
         UITheme::fill({6, UITheme::kScreenH - 13, 9, UITheme::kScreenH - 4}, catCol);
     }
     UITheme::text(pros::E_TEXT_SMALL, 14, UITheme::kScreenH - 12,
-                  UITheme::kDimGray, UITheme::kBgAlt, "Auton: %s", vm.autonName.c_str());
+                  UITheme::kDimGray, UITheme::kBgAlt, "Auton: %s", vm.autonName);
 }
 
 }  // anonymous namespace
@@ -544,6 +571,7 @@ void init() {
     s_relativeOriginX      = 0.0f;
     s_relativeOriginY      = 0.0f;
     s_relativeOriginTheta  = 0.0f;
+    s_hasLastRenderedVm    = false;
 }
 
 void render(const ViewModel& vm) {
@@ -555,6 +583,10 @@ void render(const ViewModel& vm) {
     if (s_page != s_pagePrev) {
         s_pagePrev = s_page;
         s_dirty = true;
+    }
+
+    if (!s_dirty && s_hasLastRenderedVm && sameViewModel(vm, s_lastRenderedVm)) {
+        return;
     }
 
     if (s_dirty) {
@@ -573,6 +605,9 @@ void render(const ViewModel& vm) {
         case Page::SELECT: drawSelectPage(vm); break;
         case Page::INFO:   drawInfoPage(vm);   break;
     }
+
+    s_lastRenderedVm = vm;
+    s_hasLastRenderedVm = true;
 }
 
 void renderBoot(float progress, const char* label) {
@@ -592,7 +627,7 @@ void renderBoot(float progress, const char* label) {
 
     UITheme::textCenter(pros::E_TEXT_LARGE,
                         UITheme::makeRect(cx, cy, cardW, 30), cy + 10,
-                        UITheme::kWhite, UITheme::kBgAlt, "BIGGA 5");
+                        UITheme::kWhite, UITheme::kBgAlt, "BIGGA 6");
 
     UITheme::textCenter(pros::E_TEXT_SMALL,
                         UITheme::makeRect(cx, cy, cardW, 30), cy + 36,

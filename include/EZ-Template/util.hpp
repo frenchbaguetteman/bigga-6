@@ -6,15 +6,28 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #pragma once
 
-#include <bits/stdc++.h>
-#include <stdio.h>
-#include <string.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 #include "api.h"
 #include "okapi/api/units/QAngle.hpp"
 #include "okapi/api/units/QLength.hpp"
 #include "okapi/api/units/QTime.hpp"
-#include "util.hpp"
 
 using namespace okapi::literals;
 

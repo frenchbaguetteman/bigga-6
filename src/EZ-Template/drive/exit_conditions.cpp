@@ -138,6 +138,40 @@ void Drive::pid_wait() {
 
   // Odom Exits
   else if (mode == POINT_TO_POINT || mode == PURE_PURSUIT) {
+    if (odom_feedback_get() == LTV_FEEDBACK) {
+      const double total_time_s = odom_reference_states.empty()
+                                      ? 0.0
+                                      : odom_reference_states.back().time;
+      // Wait for trajectory time, then let the voltage settler bring the
+      // pose inside spec (driven by odom_reference_task()).
+      while (((pros::millis() - odom_reference_start_ms) / 1000.0) <
+             total_time_s) {
+        pros::delay(util::DELAY_TIME);
+      }
+
+      // Wait up to kSettleMaxS (5s) for the settler to mark done.
+      constexpr std::uint32_t kSettleWaitCapMs = 6000;
+      const std::uint32_t settle_wait_start = pros::millis();
+      while (odom_settle_phase != 4 &&
+             (pros::millis() - settle_wait_start) < kSettleWaitCapMs) {
+        pros::delay(util::DELAY_TIME);
+      }
+
+      if (print_toggle && !odom_reference_states.empty()) {
+        const pose current_pose = odom_pose_get();
+        const pose final_target = odom_reference_states.back().target_pose;
+        const double translation_error =
+            util::distance_to_point(final_target, current_pose);
+        const double heading_error =
+            std::fabs(util::wrap_angle(final_target.theta - odom_theta_get()));
+        std::cout << "  Tracking: Settle Exit, error: (xy " << translation_error
+                  << ", ang " << heading_error << ")\n";
+      }
+
+      drive_mode_set(DISABLE);
+      return;
+    }
+
     exit_output xy_exit = RUNNING;
     exit_output a_exit = RUNNING;
     double xy_exit_error = 0.0;
@@ -149,28 +183,30 @@ void Drive::pid_wait() {
       while (pp_index != pp_movements.size() - 1) {
         xyPID.velocity_sensor_secondary_set(drive_imu_accel_get());
         current_a_odomPID.velocity_sensor_secondary_set(drive_imu_accel_get());
-        if (xy_exit == RUNNING) {
-          auto next_xy_exit = xyPID.exit_condition({left_motors[0], right_motors[0]});
-          if (next_xy_exit != RUNNING) {
-            xy_exit = next_xy_exit;
-            xy_exit_error = xyPID.error;
-          }
-        }
-        if (a_exit == RUNNING) {
-          auto next_a_exit = current_a_odomPID.exit_condition({left_motors[0], right_motors[0]});
-          if (next_a_exit != RUNNING) {
-            a_exit = next_a_exit;
-            a_exit_error = current_a_odomPID.error;
-          }
-        }
+        auto next_xy_exit = xyPID.exit_condition({left_motors[0], right_motors[0]});
+        auto next_a_exit = current_a_odomPID.exit_condition({left_motors[0], right_motors[0]});
 
-        if ((xy_exit == mA_EXIT || xy_exit == VELOCITY_EXIT) && (a_exit == mA_EXIT || a_exit == VELOCITY_EXIT)) {
+        if ((next_xy_exit == mA_EXIT || next_xy_exit == VELOCITY_EXIT) &&
+            (next_a_exit == mA_EXIT || next_a_exit == VELOCITY_EXIT)) {
+          xy_exit = next_xy_exit;
+          a_exit = next_a_exit;
+          xy_exit_error = xyPID.error;
+          a_exit_error = current_a_odomPID.error;
           if (print_toggle) std::cout << "  XY: " << exit_to_string(xy_exit) << " Exited early, error: " << xy_exit_error << ".   Angle: " << exit_to_string(a_exit) << " Exited early, error: " << a_exit_error << ".\n";
           printed_early_exit = true;
           break;
         }
 
         pros::delay(util::DELAY_TIME);
+      }
+
+      if (!printed_early_exit) {
+        xyPID.timers_reset();
+        current_a_odomPID.timers_reset();
+        xy_exit = RUNNING;
+        a_exit = RUNNING;
+        xy_exit_error = 0.0;
+        a_exit_error = 0.0;
       }
     }
 
@@ -196,9 +232,12 @@ void Drive::pid_wait() {
     }
     if (print_toggle && !printed_early_exit) std::cout << "  XY: " << exit_to_string(xy_exit) << " Exit, error: " << xy_exit_error << ".   Angle: " << exit_to_string(a_exit) << " Exit, error: " << a_exit_error << ".\n";
 
-    if (xy_exit == mA_EXIT || xy_exit == VELOCITY_EXIT || a_exit == mA_EXIT || a_exit == VELOCITY_EXIT) {
+    if (xy_exit == mA_EXIT || xy_exit == VELOCITY_EXIT || a_exit == mA_EXIT ||
+        a_exit == VELOCITY_EXIT) {
       interfered = true;
     }
+
+    drive_mode_set(DISABLE);
   }
 
   // Turn Exit

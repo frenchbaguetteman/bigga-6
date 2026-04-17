@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#include <string>
 #include <vector>
+#include <string>
 
 namespace ScreenManager {
 
@@ -25,7 +25,7 @@ struct ViewModel {
     float odomTheta = 0.0f;
 
     // ── Selector ──────────────────────────────────────────
-    std::string autonName = "None";
+    char autonName[32] = "None";
     int autonIndex        = 0;
     int autonCount        = 0;
 
@@ -33,10 +33,10 @@ struct ViewModel {
     float batteryPct     = 0.0f;   // 0–100
     float batteryVolts   = 0.0f;   // e.g. 12.6
     float motorTempMax   = 0.0f;   // hottest motor °C
-    std::string hotMotor = "";     // name of hottest motor
+    char hotMotor[16]    = "";     // name of hottest motor
 
     // ── Status ────────────────────────────────────────────
-    std::string status = "";       // e.g. "Competition ready"
+    char status[32] = "";          // e.g. "Competition ready"
     bool compConnected = false;
     bool imuCalibrated = true;
 };

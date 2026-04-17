@@ -1,454 +1,484 @@
 /**
  * @file ltv_controller.hpp
- * LTV (Linear Time-Varying) unicycle path-tracking controller.
  *
- * Implements the LQR-style feedback law from bigga-4 without Eigen.
- * All matrix math is done with fixed-size std::array<> types.
- *
- * State error  e = [x_err, y_err, θ_err]ᵀ  (robot frame, inches / radians internal)
- *
- * Accepts EZ-Template convention inputs: inches, degrees (0°=+Y, CW positive).
- * Control      u = [Δv, Δω]ᵀ
- *
- * Usage:
- *   LtvController ctrl;
- *   // In a loop:
- *   auto [leftPct, rightPct] = ctrl.calculate(cx, cy, ct,
- *                                              dx, dy, dt,
- *                                              vRef, omegaRef);
- *   chassis.drive_set(leftPct, rightPct);
+ * Local units-adapted port of WPILib's frc::LTVUnicycleController.
  */
 #pragma once
 
-#include "robot_config.hpp"
-
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
-#include <algorithm>
-
 
 namespace ltv {
 
-// ── Tiny fixed-size matrix types ─────────────────────────────────────────────
-using Vec2  = std::array<float, 2>;
-using Vec3  = std::array<float, 3>;
-using Mat22 = std::array<std::array<float, 2>, 2>;
-using Mat33 = std::array<std::array<float, 3>, 3>;
-using Mat32 = std::array<std::array<float, 2>, 3>;  // 3 rows, 2 cols
-using Mat23 = std::array<std::array<float, 3>, 2>;  // 2 rows, 3 cols (gain K)
+using Vec2 = std::array<double, 2>;
+using Vec3 = std::array<double, 3>;
+using Mat22 = std::array<std::array<double, 2>, 2>;
+using Mat32 = std::array<std::array<double, 2>, 3>;
+using Mat23 = std::array<std::array<double, 3>, 2>;
+using Mat33 = std::array<std::array<double, 3>, 3>;
 
-// ── Matrix helpers ────────────────────────────────────────────────────────────
-inline Mat33 mat33Identity() {
-    return {{{1,0,0},{0,1,0},{0,0,1}}};
-}
-inline Mat22 mat22Identity() {
-    return {{{1,0},{0,1}}};
-}
+inline constexpr double kInPerMeter = 1.0 / 0.0254;
+inline constexpr double kPi = 3.14159265358979323846;
+inline constexpr double kDeg2Rad = kPi / 180.0;
 
-inline Mat33 mat33Add(const Mat33& A, const Mat33& B) {
-    Mat33 C{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            C[i][j] = A[i][j] + B[i][j];
-    return C;
-}
-inline Mat33 mat33Scale(float s, const Mat33& A) {
-    Mat33 C{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            C[i][j] = s * A[i][j];
-    return C;
-}
-inline Mat33 mat33Mul(const Mat33& A, const Mat33& B) {
-    Mat33 C{};
-    for (int i = 0; i < 3; ++i)
-        for (int k = 0; k < 3; ++k)
-            for (int j = 0; j < 3; ++j)
-                C[i][j] += A[i][k] * B[k][j];
-    return C;
-}
-inline Mat33 mat33Transpose(const Mat33& A) {
-    Mat33 T{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            T[i][j] = A[j][i];
-    return T;
-}
-inline Mat32 mat33MulMat32(const Mat33& A, const Mat32& B) {
-    Mat32 C{};
-    for (int i = 0; i < 3; ++i)
-        for (int k = 0; k < 3; ++k)
-            for (int j = 0; j < 2; ++j)
-                C[i][j] += A[i][k] * B[k][j];
-    return C;
-}
-inline Mat23 mat32TransposeMulMat33(const Mat32& B, const Mat33& A) {
-    // B^T (2x3) * A (3x3) = (2x3)
-    Mat23 C{};
-    for (int i = 0; i < 2; ++i)
-        for (int k = 0; k < 3; ++k)
-            for (int j = 0; j < 3; ++j)
-                C[i][j] += B[k][i] * A[k][j];
-    return C;
-}
-inline Mat22 mat32TransposeMulMat32(const Mat32& B) {
-    // B^T (2x3) * B (3x2) = (2x2)
-    Mat22 C{};
-    for (int k = 0; k < 3; ++k)
-        for (int i = 0; i < 2; ++i)
-            for (int j = 0; j < 2; ++j)
-                C[i][j] += B[k][i] * B[k][j];
-    return C;
-}
-inline Mat23 mat23MulMat33(const Mat23& K, const Mat33& A) {
-    Mat23 C{};
-    for (int i = 0; i < 2; ++i)
-        for (int k = 0; k < 3; ++k)
-            for (int j = 0; j < 3; ++j)
-                C[i][j] += K[i][k] * A[k][j];
-    return C;
-}
-inline Mat33 mat33Symmetrize(const Mat33& A) {
-    Mat33 S{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            S[i][j] = 0.5f * (A[i][j] + A[j][i]);
-    return S;
-}
-inline Vec2 mat23MulVec3(const Mat23& K, const Vec3& e) {
-    Vec2 u{};
-    for (int i = 0; i < 2; ++i)
-        for (int j = 0; j < 3; ++j)
-            u[i] += K[i][j] * e[j];
-    return u;
-}
-inline Vec3 mat32MulVec2(const Mat32& B, const Vec2& u) {
-    Vec3 y{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 2; ++j)
-            y[i] += B[i][j] * u[j];
-    return y;
-}
-inline Mat22 mat22Add(const Mat22& A, const Mat22& B) {
-    return {{{A[0][0]+B[0][0], A[0][1]+B[0][1]},
-             {A[1][0]+B[1][0], A[1][1]+B[1][1]}}};
-}
-inline Mat22 mat22Invert(const Mat22& A) {
-    float det = A[0][0]*A[1][1] - A[0][1]*A[1][0];
-    if (std::fabs(det) < 1e-9f)
-        return {{{1,0},{0,1}}};  // fallback
-    float invDet = 1.0f / det;
-    return {{{ A[1][1]*invDet, -A[0][1]*invDet},
-             {-A[1][0]*invDet,  A[0][0]*invDet}}};
-}
-inline Mat23 mat22MulMat23(const Mat22& A, const Mat23& B) {
-    Mat23 C{};
-    for (int i = 0; i < 2; ++i)
-        for (int k = 0; k < 2; ++k)
-            for (int j = 0; j < 3; ++j)
-                C[i][j] += A[i][k] * B[k][j];
-    return C;
-}
-// (2x3) * (3x2) = (2x2)
-inline Mat22 mat23MulMat32(const Mat23& A, const Mat32& B) {
-    Mat22 C{};
-    for (int i = 0; i < 2; ++i)
-        for (int k = 0; k < 3; ++k)
-            for (int j = 0; j < 2; ++j)
-                C[i][j] += A[i][k] * B[k][j];
-    return C;
-}
-// A (3x3) - B*C (3x3)
-inline Mat33 mat33Sub(const Mat33& A, const Mat33& B) {
-    Mat33 C{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            C[i][j] = A[i][j] - B[i][j];
-    return C;
-}
-inline float mat33MaxAbsDiff(const Mat33& A, const Mat33& B) {
-    float m = 0.0f;
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            m = std::max(m, std::fabs(A[i][j] - B[i][j]));
-    return m;
-}
-// A^T * P * A
-inline Mat33 mat33TPA(const Mat33& A, const Mat33& P) {
-    return mat33Mul(mat33Transpose(A), mat33Mul(P, A));
-}
-// A^T * P * B  → (3x3)^T*(3x3)*(3x2) = (3x2) then B^T*P*B skipped, compute directly
-inline Mat32 mat33TPAb(const Mat33& A, const Mat33& P, const Mat32& B) {
-    // (A^T * P) first
-    Mat33 ATP = mat33Mul(mat33Transpose(A), P);
-    return mat33MulMat32(ATP, B);
+inline constexpr double kDefaultQxIn = 0.0625 * kInPerMeter;
+inline constexpr double kDefaultQyIn = 0.1250 * kInPerMeter;
+inline constexpr double kDefaultQthetaRad = 2.0;
+inline constexpr double kDefaultRvInps = 1.0 * kInPerMeter;
+inline constexpr double kDefaultRwRadps = 2.0;
+inline constexpr double kVelocityStepInps = 0.01 * kInPerMeter;
+inline constexpr double kNearZeroVelInps = 1e-4 * kInPerMeter;
+inline constexpr double kMaxVelocityUpperInps = 15.0 * kInPerMeter;
+inline constexpr double kWpilibDefaultMaxVelInps = 9.0 * kInPerMeter;
+
+// Minimum |velocity| used when looking up a gain. Below this, the linearized
+// y/heading coupling (A[1][2] = v) is too weak to produce meaningful
+// cross-track correction, so the lookup clamps the effective velocity while
+// preserving sign. Does not affect how the gain table is built.
+inline constexpr double kMinLookupVelInps = 6.0;
+
+struct Translation2d {
+  double x = 0.0;
+  double y = 0.0;
+
+  double X() const { return x; }
+  double Y() const { return y; }
+};
+
+struct Rotation2d {
+  double radians = 0.0;
+
+  double Radians() const { return radians; }
+};
+
+inline double WrapAngle(double angle) {
+  while (angle > kPi) {
+    angle -= 2.0 * kPi;
+  }
+  while (angle < -kPi) {
+    angle += 2.0 * kPi;
+  }
+  return angle;
 }
 
-// ── Linearized unicycle discrete model ───────────────────────────────────────
-inline Mat33 makeAd(float v, float dt) {
-    Mat33 A = mat33Identity();
-    A[1][2] = v * dt;
-    return A;
+struct Pose2d {
+  double x = 0.0;
+  double y = 0.0;
+  double theta = 0.0;
+
+  double X() const { return x; }
+  double Y() const { return y; }
+  Translation2d Translation() const { return {x, y}; }
+  Rotation2d Rotation() const { return {theta}; }
+
+  Pose2d RelativeTo(const Pose2d& other) const {
+    const double dx = x - other.x;
+    const double dy = y - other.y;
+    const double c = std::cos(other.theta);
+    const double s = std::sin(other.theta);
+    return {c * dx + s * dy, -s * dx + c * dy, WrapAngle(theta - other.theta)};
+  }
+};
+
+struct ChassisSpeeds {
+  double vx = 0.0;
+  double vy = 0.0;
+  double omega = 0.0;
+};
+
+struct TrajectoryState {
+  Pose2d pose;
+  double velocity = 0.0;
+  double curvature = 0.0;
+};
+
+inline Mat33 Mat33Identity() {
+  return {{{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}}};
 }
-inline Mat32 makeBd(float v, float dt) {
-    Mat32 B{};
-    B[0][0] = dt;
-    B[1][1] = 0.5f * v * dt * dt;
-    B[2][1] = dt;
-    return B;
-}
-inline Mat33 makeDiag3(const Vec3& d) {
-    return {{{d[0],0,0},{0,d[1],0},{0,0,d[2]}}};
-}
-inline Mat22 makeDiag2(const Vec2& d) {
-    return {{{d[0],0},{0,d[1]}}};
-}
 
-// ── Discrete Riccati iteration ────────────────────────────────────────────────
-inline Mat33 solveRiccati(const Mat33& Ad, const Mat32& Bd,
-                          const Mat33& Q,  const Mat22& R,
-                          int maxIter = 500, float tol = 1e-5f) {
-    Mat33 P = Q;
-    for (int iter = 0; iter < maxIter; ++iter) {
-        // lhs = R + Bd^T * P * Bd  (2x2)
-        // P*Bd (3x2)
-        Mat32 PBd{};
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 2; ++j)
-                for (int k = 0; k < 3; ++k)
-                    PBd[i][j] += P[i][k] * Bd[k][j];
-        // Bd^T * PBd (2x2)
-        Mat22 BtPBd{};
-        for (int i = 0; i < 2; ++i)
-            for (int j = 0; j < 2; ++j)
-                for (int k = 0; k < 3; ++k)
-                    BtPBd[i][j] += Bd[k][i] * PBd[k][j];
-        Mat22 lhs = mat22Add(R, BtPBd);
-        Mat22 lhsInv = mat22Invert(lhs);
-
-        // K = lhsInv * Bd^T * P * Ad
-        // Bd^T * P * Ad = Bd^T * (P*Ad)
-        Mat33 PAd{};
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j)
-                for (int k = 0; k < 3; ++k)
-                    PAd[i][j] += P[i][k] * Ad[k][j];
-        Mat23 BtPAd{};
-        for (int i = 0; i < 2; ++i)
-            for (int j = 0; j < 3; ++j)
-                for (int k = 0; k < 3; ++k)
-                    BtPAd[i][j] += Bd[k][i] * PAd[k][j];
-        Mat23 K = mat22MulMat23(lhsInv, BtPAd);
-
-        // Ad - Bd * K (3x3)
-        Mat32 BdArr = Bd;
-        Mat33 BdK{};
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j)
-                for (int k = 0; k < 2; ++k)
-                    BdK[i][j] += BdArr[i][k] * K[k][j];
-        Mat33 AdMinusBdK = mat33Sub(Ad, BdK);
-
-        // P_next = Ad^T * P * (Ad - Bd*K) + Q
-        Mat33 tmp{};
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j)
-                for (int k = 0; k < 3; ++k)
-                    tmp[i][j] += Ad[k][i] * P[k][j];  // Ad^T * P → tmp
-        Mat33 tmp2{};
-        for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j)
-                for (int k = 0; k < 3; ++k)
-                    tmp2[i][j] += tmp[i][k] * AdMinusBdK[k][j];
-        Mat33 Pnext = mat33Add(tmp2, Q);
-        Pnext = mat33Symmetrize(Pnext);
-
-        if (mat33MaxAbsDiff(Pnext, P) <= tol) return Pnext;
-        P = Pnext;
+inline Mat33 Mat33Add(const Mat33& A, const Mat33& B) {
+  Mat33 result{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      result[i][j] = A[i][j] + B[i][j];
     }
-    return P;
+  }
+  return result;
 }
 
-inline Mat23 solveGain(float v, const Vec3& q, const Vec2& r, float dt) {
-    // Match WPILib's near-zero velocity guard, converted from m/s to in/s.
-    constexpr float kMinV = 1e-4f / RobotConfig::IN_TO_M;
-    if (std::fabs(v) < kMinV)
-        v = (v < 0.0f) ? -kMinV : kMinV;
-
-    Mat33 Ad = makeAd(v, dt);
-    Mat32 Bd = makeBd(v, dt);
-    Mat33 Q  = makeDiag3(q);
-    Mat22 R  = makeDiag2(r);
-    Mat33 P  = solveRiccati(Ad, Bd, Q, R);
-
-    // K = (R + Bd^T*P*Bd)^{-1} * Bd^T * P * Ad
-    Mat32 PBd{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 2; ++j)
-            for (int k = 0; k < 3; ++k)
-                PBd[i][j] += P[i][k] * Bd[k][j];
-    Mat22 BtPBd{};
-    for (int i = 0; i < 2; ++i)
-        for (int j = 0; j < 2; ++j)
-            for (int k = 0; k < 3; ++k)
-                BtPBd[i][j] += Bd[k][i] * PBd[k][j];
-    Mat22 lhsInv = mat22Invert(mat22Add(R, BtPBd));
-
-    Mat33 PAd{};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            for (int k = 0; k < 3; ++k)
-                PAd[i][j] += P[i][k] * Ad[k][j];
-    Mat23 BtPAd{};
-    for (int i = 0; i < 2; ++i)
-        for (int j = 0; j < 3; ++j)
-            for (int k = 0; k < 3; ++k)
-                BtPAd[i][j] += Bd[k][i] * PAd[k][j];
-
-    return mat22MulMat23(lhsInv, BtPAd);
+inline Mat33 Mat33Sub(const Mat33& A, const Mat33& B) {
+  Mat33 result{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      result[i][j] = A[i][j] - B[i][j];
+    }
+  }
+  return result;
 }
 
-// ── Wrap angle to [-π, π] ─────────────────────────────────────────────────────
-inline float wrapAngle(float a) {
-    while (a >  3.14159265f) a -= 6.28318530f;
-    while (a < -3.14159265f) a += 6.28318530f;
-    return a;
+inline Mat33 Mat33Mul(const Mat33& A, const Mat33& B) {
+  Mat33 result{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      for (int k = 0; k < 3; ++k) {
+        result[i][j] += A[i][k] * B[k][j];
+      }
+    }
+  }
+  return result;
+}
+
+inline Mat32 Mat33Mul32(const Mat33& A, const Mat32& B) {
+  Mat32 result{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 2; ++j) {
+      for (int k = 0; k < 3; ++k) {
+        result[i][j] += A[i][k] * B[k][j];
+      }
+    }
+  }
+  return result;
+}
+
+inline Mat23 Mat23Mul33(const Mat23& A, const Mat33& B) {
+  Mat23 result{};
+  for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      for (int k = 0; k < 3; ++k) {
+        result[i][j] += A[i][k] * B[k][j];
+      }
+    }
+  }
+  return result;
+}
+
+inline Mat33 Mat32Mul23(const Mat32& A, const Mat23& B) {
+  Mat33 result{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        result[i][j] += A[i][k] * B[k][j];
+      }
+    }
+  }
+  return result;
+}
+
+inline Mat22 Mat23Mul32(const Mat23& A, const Mat32& B) {
+  Mat22 result{};
+  for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 2; ++j) {
+      for (int k = 0; k < 3; ++k) {
+        result[i][j] += A[i][k] * B[k][j];
+      }
+    }
+  }
+  return result;
+}
+
+inline Mat33 Mat33Transpose(const Mat33& A) {
+  Mat33 result{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      result[i][j] = A[j][i];
+    }
+  }
+  return result;
+}
+
+inline double Mat33FrobeniusNorm(const Mat33& A) {
+  double sum = 0.0;
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      sum += A[i][j] * A[i][j];
+    }
+  }
+  return std::sqrt(sum);
+}
+
+inline Mat22 Mat22Invert(const Mat22& A) {
+  const double det = (A[0][0] * A[1][1]) - (A[0][1] * A[1][0]);
+  if (std::fabs(det) < 1e-12) {
+    throw std::domain_error("LTVUnicycleController: singular 2x2 matrix");
+  }
+  const double inv_det = 1.0 / det;
+  return {{{A[1][1] * inv_det, -A[0][1] * inv_det},
+           {-A[1][0] * inv_det, A[0][0] * inv_det}}};
+}
+
+inline Mat33 Mat33Invert(const Mat33& A) {
+  const double a00 = A[0][0];
+  const double a01 = A[0][1];
+  const double a02 = A[0][2];
+  const double a10 = A[1][0];
+  const double a11 = A[1][1];
+  const double a12 = A[1][2];
+  const double a20 = A[2][0];
+  const double a21 = A[2][1];
+  const double a22 = A[2][2];
+
+  const double c00 = (a11 * a22) - (a12 * a21);
+  const double c01 = -((a10 * a22) - (a12 * a20));
+  const double c02 = (a10 * a21) - (a11 * a20);
+  const double c10 = -((a01 * a22) - (a02 * a21));
+  const double c11 = (a00 * a22) - (a02 * a20);
+  const double c12 = -((a00 * a21) - (a01 * a20));
+  const double c20 = (a01 * a12) - (a02 * a11);
+  const double c21 = -((a00 * a12) - (a02 * a10));
+  const double c22 = (a00 * a11) - (a01 * a10);
+
+  const double det = (a00 * c00) + (a01 * c01) + (a02 * c02);
+  if (std::fabs(det) < 1e-12) {
+    throw std::domain_error("LTVUnicycleController: singular 3x3 matrix");
+  }
+
+  const double inv_det = 1.0 / det;
+  return {{{c00 * inv_det, c10 * inv_det, c20 * inv_det},
+           {c01 * inv_det, c11 * inv_det, c21 * inv_det},
+           {c02 * inv_det, c12 * inv_det, c22 * inv_det}}};
+}
+
+inline Vec2 Mat23MulVec3(const Mat23& A, const Vec3& x) {
+  Vec2 result{};
+  for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      result[i] += A[i][j] * x[j];
+    }
+  }
+  return result;
+}
+
+inline Mat33 MakeCostMatrix3(const Vec3& tolerances) {
+  Mat33 result{};
+  for (int i = 0; i < 3; ++i) {
+    result[i][i] = 1.0 / (tolerances[i] * tolerances[i]);
+  }
+  return result;
+}
+
+inline Mat22 MakeCostMatrix2(const Vec2& tolerances) {
+  Mat22 result{};
+  for (int i = 0; i < 2; ++i) {
+    result[i][i] = 1.0 / (tolerances[i] * tolerances[i]);
+  }
+  return result;
+}
+
+inline Mat33 MakeDiscA(double velocity, double dt) {
+  Mat33 A = Mat33Identity();
+  A[1][2] = velocity * dt;
+  return A;
+}
+
+inline Mat32 MakeDiscB(double velocity, double dt) {
+  Mat32 B{};
+  B[0][0] = dt;
+  B[1][1] = 0.5 * velocity * dt * dt;
+  B[2][1] = dt;
+  return B;
+}
+
+inline Mat33 DetailDARE(const Mat33& A, const Mat32& B, const Mat33& Q,
+                        const Mat22& R) {
+  Mat33 A_k = A;
+
+  Mat32 BRinv{};
+  const Mat22 R_inv = Mat22Invert(R);
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 2; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        BRinv[i][j] += B[i][k] * R_inv[k][j];
+      }
+    }
+  }
+
+  Mat33 G_k{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        G_k[i][j] += BRinv[i][k] * B[j][k];
+      }
+    }
+  }
+
+  Mat33 H_k{};
+  Mat33 H_k1 = Q;
+
+  do {
+    H_k = H_k1;
+
+    const Mat33 W = Mat33Add(Mat33Identity(), Mat33Mul(G_k, H_k));
+    const Mat33 W_inv = Mat33Invert(W);
+    const Mat33 V_1 = Mat33Mul(W_inv, A_k);
+    const Mat33 V_2 = Mat33Mul(W_inv, G_k);
+
+    G_k = Mat33Add(G_k, Mat33Mul(Mat33Mul(A_k, V_2), Mat33Transpose(A_k)));
+    H_k1 = Mat33Add(H_k, Mat33Mul(Mat33Mul(Mat33Transpose(V_1), H_k), A_k));
+    A_k = Mat33Mul(A_k, V_1);
+  } while (Mat33FrobeniusNorm(Mat33Sub(H_k1, H_k)) >
+           1e-10 * Mat33FrobeniusNorm(H_k1));
+
+  return H_k1;
+}
+
+inline Mat23 SolveGainAtVelocity(double velocity, const Mat33& Q,
+                                 const Mat22& R, double dt) {
+  const double A_y_heading =
+      std::fabs(velocity) < kNearZeroVelInps ? kNearZeroVelInps : velocity;
+
+  const Mat33 discA = MakeDiscA(A_y_heading, dt);
+  const Mat32 discB = MakeDiscB(A_y_heading, dt);
+  const Mat33 S = DetailDARE(discA, discB, Q, R);
+
+  const Mat23 discB_T = {{
+      {discB[0][0], discB[1][0], discB[2][0]},
+      {discB[0][1], discB[1][1], discB[2][1]},
+  }};
+
+  const Mat23 BtS = Mat23Mul33(discB_T, S);
+  const Mat22 lhs = [](
+                         const Mat22& a,
+                         const Mat22& b) {
+    Mat22 result{};
+    for (int i = 0; i < 2; ++i) {
+      for (int j = 0; j < 2; ++j) {
+        result[i][j] = a[i][j] + b[i][j];
+      }
+    }
+    return result;
+  }(Mat23Mul32(BtS, discB), R);
+
+  const Mat22 lhs_inv = Mat22Invert(lhs);
+  const Mat23 rhs = Mat23Mul33(BtS, discA);
+
+  Mat23 K{};
+  for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        K[i][j] += lhs_inv[i][k] * rhs[k][j];
+      }
+    }
+  }
+  return K;
 }
 
 }  // namespace ltv
 
-// ── Shared structs (outside class to avoid C++ aggregate init limitation) ────
-struct LtvDiffSpeeds { int left, right; };  // [-127, 127] motor commands
+class LTVUnicycleController {
+ public:
+  explicit LTVUnicycleController(
+      double dt, double maxVelocity = ltv::kWpilibDefaultMaxVelInps)
+      : LTVUnicycleController({ltv::kDefaultQxIn, ltv::kDefaultQyIn,
+                               ltv::kDefaultQthetaRad},
+                              {ltv::kDefaultRvInps, ltv::kDefaultRwRadps}, dt,
+                              maxVelocity) {}
 
-struct LtvConfig {
-    ltv::Vec3  q            = {RobotConfig::LTV_Q_X, RobotConfig::LTV_Q_Y, RobotConfig::LTV_Q_THETA};
-    ltv::Vec2  r            = {RobotConfig::LTV_R_V, RobotConfig::LTV_R_OMEGA};
-    float      dt           = RobotConfig::LTV_DT_S;
-    float      maxVelInps   = RobotConfig::LTV_MAX_VEL_INPS;
-    float      lookupStep   = RobotConfig::LTV_LOOKUP_STEP;
-    float      trackWidthIn = RobotConfig::TRACK_WIDTH_IN;
-};
-
-// ── LtvController ─────────────────────────────────────────────────────────────
-class LtvController {
-public:
-    using DiffSpeeds = LtvDiffSpeeds;
-    using Config     = LtvConfig;
-    struct ChassisCommand { float linear, angular; };
-
-    explicit LtvController(LtvConfig cfg = LtvConfig{}) : m_cfg(cfg) {
-        buildLookupTable();
+  LTVUnicycleController(const ltv::Vec3& Qelems, const ltv::Vec2& Relems,
+                        double dt, double maxVelocity = ltv::kWpilibDefaultMaxVelInps) {
+    if (maxVelocity <= 0.0) {
+      throw std::domain_error("Max velocity must be greater than 0 m/s.");
+    }
+    if (maxVelocity >= ltv::kMaxVelocityUpperInps) {
+      throw std::domain_error("Max velocity must be less than 15 m/s.");
     }
 
-    /**
-     * Calculate motor commands.
-     * @param cx/cy/ctheta  current pose — inches / degrees (EZ-Template odom)
-     * @param dx/dy/dtheta  desired pose — inches / degrees
-     * @param vRef          desired linear velocity (in/s)
-     * @param omegaRef      desired angular velocity (deg/s)
-     */
-    ChassisCommand calculateChassisSpeeds(float cx, float cy, float ctheta,
-                                          float dx, float dy, float dtheta,
-                                          float vRef, float omegaRef) {
-        // Convert EZ-Template degrees to radians for internal math
-        constexpr float kDeg2Rad = 3.14159265f / 180.0f;
-        float ctRad       = ctheta   * kDeg2Rad;
-        float omegaRefRad = omegaRef * kDeg2Rad;
+    const ltv::Mat33 Q = ltv::MakeCostMatrix3(Qelems);
+    const ltv::Mat22 R = ltv::MakeCostMatrix2(Relems);
 
-        // Error in robot frame  (EZ convention: 0°=+Y, CW positive)
-        float sinT = std::sin(ctRad);
-        float cosT = std::cos(ctRad);
-        float dxW  = dx - cx;
-        float dyW  = dy - cy;
-        m_lastErr[0] =  sinT * dxW + cosT * dyW;   // forward error
-        m_lastErr[1] =  cosT * dxW - sinT * dyW;   // lateral error (right +)
-        m_lastErr[2] = ltv::wrapAngle((dtheta - ctheta) * kDeg2Rad);
-
-        ltv::Mat23 K    = gainForVelocity(vRef);
-        ltv::Vec2  corr = ltv::mat23MulVec3(K, m_lastErr);
-
-        float v     = vRef        + corr[0];
-        float omega = omegaRefRad + corr[1];
-
-        m_lastV     = v;
-        m_lastOmega = omega;
-
-        return {v, omega};
+    for (double velocity = -maxVelocity; velocity < maxVelocity;
+         velocity += ltv::kVelocityStepInps) {
+      m_velocities.push_back(velocity);
+      m_gains.push_back(ltv::SolveGainAtVelocity(velocity, Q, R, dt));
     }
 
-    DiffSpeeds calculate(float cx, float cy, float ctheta,
-                         float dx, float dy, float dtheta,
-                         float vRef, float omegaRef) {
-        const auto cmd = calculateChassisSpeeds(cx, cy, ctheta, dx, dy, dtheta,
-                                                vRef, omegaRef);
-        return toMotorCommands(cmd.linear, cmd.angular);
+    m_poseTolerance = {0.5, 0.5, 0.05};
+  }
+
+  const ltv::Pose2d& PoseError() const { return m_poseError; }
+
+  bool AtReference() const {
+    const auto& eTranslate = m_poseError.Translation();
+    const auto& eRotate = m_poseError.Rotation();
+    const auto& tolTranslate = m_poseTolerance.Translation();
+    const auto& tolRotate = m_poseTolerance.Rotation();
+
+    return std::fabs(eTranslate.X()) < tolTranslate.X() &&
+           std::fabs(eTranslate.Y()) < tolTranslate.Y() &&
+           std::fabs(eRotate.Radians()) < tolRotate.Radians();
+  }
+
+  void SetTolerance(const ltv::Pose2d& poseTolerance) {
+    m_poseTolerance = poseTolerance;
+  }
+
+  ltv::ChassisSpeeds Calculate(const ltv::Pose2d& currentPose,
+                               const ltv::Pose2d& poseRef,
+                               double linearVelocityRef,
+                               double angularVelocityRef) {
+    if (!m_enabled) {
+      return {linearVelocityRef, 0.0, angularVelocityRef};
     }
 
-    const ltv::Vec3& lastError() const { return m_lastErr; }
-    float lastV()     const { return m_lastV; }
-    float lastOmega() const { return m_lastOmega; }
+    m_poseError = poseRef.RelativeTo(currentPose);
 
-private:
-    Config      m_cfg;
-    ltv::Vec3   m_lastErr{};
-    float       m_lastV = 0.0f, m_lastOmega = 0.0f;
+    const auto& K = GainForVelocity(linearVelocityRef);
+    const ltv::Vec3 e{m_poseError.X(), m_poseError.Y(),
+                      m_poseError.Rotation().Radians()};
+    const ltv::Vec2 u = ltv::Mat23MulVec3(K, e);
 
-    std::vector<float>       m_velSamples;
-    std::vector<ltv::Mat23>  m_gainSamples;
+    return {linearVelocityRef + u[0], 0.0, angularVelocityRef + u[1]};
+  }
 
-    void buildLookupTable() {
-        m_velSamples.clear();
-        m_gainSamples.clear();
-        const float step = std::max(1e-4f / RobotConfig::IN_TO_M,
-                                    std::fabs(m_cfg.lookupStep));
-        int n = std::max(2, static_cast<int>(
-            std::ceil(2.0f * m_cfg.maxVelInps / step)) + 1);
-        m_velSamples.reserve(n);
-        m_gainSamples.reserve(n);
-        for (int i = 0; i < n; ++i) {
-            float v = -m_cfg.maxVelInps + i * step;
-            if (i == n - 1 || v > m_cfg.maxVelInps) v = m_cfg.maxVelInps;
-            m_velSamples.push_back(v);
-            m_gainSamples.push_back(
-                ltv::solveGain(v, m_cfg.q, m_cfg.r, m_cfg.dt));
-        }
+  ltv::ChassisSpeeds Calculate(const ltv::Pose2d& currentPose,
+                               const ltv::TrajectoryState& desiredState) {
+    return Calculate(currentPose, desiredState.pose, desiredState.velocity,
+                     desiredState.velocity * desiredState.curvature);
+  }
+
+  void SetEnabled(bool enabled) { m_enabled = enabled; }
+
+ private:
+  const ltv::Mat23& GainForVelocity(double velocity) const {
+    // Clamp the lookup velocity away from zero so low-speed gains retain
+    // cross-track authority (the gain table itself is not modified).
+    if (std::fabs(velocity) < ltv::kMinLookupVelInps) {
+      velocity = velocity < 0.0 ? -ltv::kMinLookupVelInps
+                                : ltv::kMinLookupVelInps;
     }
 
-    ltv::Mat23 gainForVelocity(float v) const {
-        if (m_velSamples.empty())
-            return ltv::solveGain(v, m_cfg.q, m_cfg.r, m_cfg.dt);
-        if (v <= m_velSamples.front()) return m_gainSamples.front();
-        if (v >= m_velSamples.back())  return m_gainSamples.back();
-
-        auto it = std::lower_bound(m_velSamples.begin(), m_velSamples.end(), v);
-        size_t hi = static_cast<size_t>(it - m_velSamples.begin());
-        size_t lo = hi - 1;
-        float range = m_velSamples[hi] - m_velSamples[lo];
-        float alpha = (range < 1e-6f) ? 0.0f :
-                      (v - m_velSamples[lo]) / range;
-
-        ltv::Mat23 K{};
-        for (int i = 0; i < 2; ++i)
-            for (int j = 0; j < 3; ++j)
-                K[i][j] = (1.0f - alpha) * m_gainSamples[lo][i][j]
-                           + alpha       * m_gainSamples[hi][i][j];
-        return K;
+    if (velocity <= m_velocities.front()) {
+      return m_gains.front();
+    }
+    if (velocity >= m_velocities.back()) {
+      return m_gains.back();
     }
 
-    DiffSpeeds toMotorCommands(float v, float omega) const {
-        float tw2  = m_cfg.trackWidthIn / 2.0f;
-        // CW-positive convention: positive ω → left faster, right slower
-        float vL   = v + omega * tw2;
-        float vR   = v - omega * tw2;
-        float norm = std::max({1.0f, std::fabs(vL)/m_cfg.maxVelInps,
-                                     std::fabs(vR)/m_cfg.maxVelInps});
-        int left  = static_cast<int>(std::round(127.0f * vL /
-                                    (m_cfg.maxVelInps * norm)));
-        int right = static_cast<int>(std::round(127.0f * vR /
-                                    (m_cfg.maxVelInps * norm)));
-        left  = std::max(-127, std::min(127, left));
-        right = std::max(-127, std::min(127, right));
-        return {left, right};
+    const auto it =
+        std::lower_bound(m_velocities.begin(), m_velocities.end(), velocity);
+    const std::size_t hi = static_cast<std::size_t>(it - m_velocities.begin());
+    const std::size_t lo = hi - 1;
+
+    const double lower = m_velocities[lo];
+    const double upper = m_velocities[hi];
+    const double t = (velocity - lower) / (upper - lower);
+
+    m_interpolatedGain = {};
+    for (int i = 0; i < 2; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        m_interpolatedGain[i][j] =
+            ((1.0 - t) * m_gains[lo][i][j]) + (t * m_gains[hi][i][j]);
+      }
     }
+    return m_interpolatedGain;
+  }
+
+  std::vector<double> m_velocities;
+  std::vector<ltv::Mat23> m_gains;
+  mutable ltv::Mat23 m_interpolatedGain{};
+  ltv::Pose2d m_poseError;
+  ltv::Pose2d m_poseTolerance;
+  bool m_enabled = true;
 };

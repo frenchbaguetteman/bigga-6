@@ -61,6 +61,10 @@ void Drive::pid_targets_reset() {
 }
 
 void Drive::odom_feedback_set(e_odom_feedback type) {
+  if (type != odom_feedback_type && odom_feedback_type != PID_FEEDBACK) {
+    end_odom_reference_trace("feedback_change");
+  }
+
   odom_feedback_type = type;
 
   if (type == PID_FEEDBACK) {
@@ -75,6 +79,7 @@ void Drive::drive_mode_set(e_mode p_mode, bool stop_drive) {
   mode = p_mode;
   if (mode == DISABLE) {
     reset_odom_reference();
+    end_odom_reference_trace("drive_disable");
   }
   if (mode == DISABLE && stop_drive)
     private_drive_set(0, 0);

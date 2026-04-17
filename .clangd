@@ -1,0 +1,14 @@
+CompileFlags:
+  Add:
+    - -std=gnu++20
+    - -Iinclude
+    - -Iinclude/EZ-Template
+    - -Iinclude/okapi/squiggles
+    - -Iinclude/EZ-Template/drive
+    - -Iinclude/ui
+    - -D_POSIX_THREADS
+    - -D_UNIX98_THREAD_MUTEX_ATTRIBUTES
+    - -D_POSIX_TIMERS
+    - -D_POSIX_MONOTONIC_CLOCK
+    - -D_PROS_INCLUDE_LIBLVGL_LLEMU_H
+    - -D_PROS_INCLUDE_LIBLVGL_LLEMU_HPP
