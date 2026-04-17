@@ -1,6 +1,5 @@
 #pragma once
 
-#include "robot_config.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -39,8 +38,8 @@ struct State {
 struct BuildConfig {
   double sample_spacing_in = 0.5;
   double heading_blend_distance_in = 7.0;
-  double track_width_in = RobotConfig::TRACK_WIDTH_IN;
-  double max_acceleration_inps2 = RobotConfig::MAX_ACCELERATION_INPS2;
+  double track_width_in = 11.338583;
+  double max_acceleration_inps2 = 118.11024;
   bool start_pose_has_heading = true;
 };
 
@@ -64,7 +63,7 @@ inline double distance_to_point(const Pose& target, const Pose& current) {
 
 inline double absolute_angle_to_point(const Pose& target, const Pose& current) {
   return std::atan2(target.x - current.x, target.y - current.y) *
-         RobotConfig::RAD_TO_DEG;
+         (180.0 / M_PI);
 }
 
 inline double lerp(double a, double b, double t) {
@@ -246,7 +245,7 @@ inline std::vector<State> build_reference_states(
       const double heading_delta =
           wrap_angle_deg(states[hi].target_pose.theta_deg -
                          states[lo].target_pose.theta_deg) *
-          RobotConfig::DEG_TO_RAD;
+          (M_PI / 180.0);
       curvature = heading_delta / distance_delta;
     }
 
@@ -303,6 +302,24 @@ inline std::vector<State> build_reference_states(
                           ? (2.0 * ds / velocity_sum)
                           : (ds / std::max(speed_limits[i], 1.0));
     states[i].time = states[i - 1].time + dt;
+  }
+
+  // Recompute angular_velocity from the actual heading/time finite difference.
+  // v·κ underspecifies ω during deceleration near an endpoint whose final
+  // heading was added by the blend: ω vanishes while heading is still
+  // sweeping, which leaves controllers without a feedforward (and zeroes
+  // RAMSETE's gain k).
+  for (std::size_t i = 0; i < states.size(); ++i) {
+    const std::size_t lo = (i == 0) ? 0 : i - 1;
+    const std::size_t hi = std::min(i + 1, states.size() - 1);
+    const double dt = states[hi].time - states[lo].time;
+    if (dt > kMinVelocityEpsilon) {
+      const double dtheta_rad =
+          wrap_angle_deg(states[hi].target_pose.theta_deg -
+                         states[lo].target_pose.theta_deg) *
+          (M_PI / 180.0);
+      states[i].angular_velocity = dtheta_rad / dt;
+    }
   }
 
   for (std::size_t i = 0; i < states.size(); ++i) {

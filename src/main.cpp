@@ -1,9 +1,13 @@
 #include "main.h"
 #include "ui/screen_manager.hpp"
 
+#include <array>
 #include <atomic>
-#include <cctype>
-#include <string>
+#include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <vector>
 
 /////
 // For installation, upgrading, documentations, and tutorials, check out our website!
@@ -13,15 +17,21 @@
 // ── Chassis constructor ───────────────────────────────────────────────────────
 // Update ports and wheel diameter/RPM to match your robot.
 ez::Drive chassis(
-  {RobotConfig::LEFT_DRIVE_PORTS[0], RobotConfig::LEFT_DRIVE_PORTS[1], RobotConfig::LEFT_DRIVE_PORTS[2]},
-  {RobotConfig::RIGHT_DRIVE_PORTS[0], RobotConfig::RIGHT_DRIVE_PORTS[1], RobotConfig::RIGHT_DRIVE_PORTS[2]},
-  RobotConfig::IMU_PORT,
+  {-11, -12, -14},
+  {18, 19, 20},
+  16,
     3.25,               // Wheel Diameter (4" wheels without screw holes ≈ 4.125)
     450.0);              // Wheel RPM = cartridge RPM * (motor gear / wheel gear)
 
 // Keep the lateral tracker reversed so EZ's global frame stays +X = right,
 // +Y = forward with this sensor mounting.
 //ez::tracking_wheel horiz_tracker(-16, 2.0, -1.771654);
+
+static bool s_brain_ui_ready = false;
+static std::atomic_bool s_practice_auton_running = false;
+static std::atomic_bool s_keep_top_after_auton = false;
+
+namespace {
 
 enum class IntakeMode {
   Off,
@@ -31,31 +41,261 @@ enum class IntakeMode {
   ScoreLow,
 };
 
-static constexpr std::uint32_t SCORE_MID_INTAKE_DELAY_MS = 300;
-static constexpr int kDriverControlDeadband = 10;
-static std::atomic_bool s_keep_top_after_auton = false;
+using AutonCategory = ScreenManager::AutonCategory;
+using AutonRoutine = void (*)();
 
-static bool driver_control_started() {
-  return std::abs(master.get_analog(ANALOG_LEFT_Y)) > kDriverControlDeadband ||
-         std::abs(master.get_analog(ANALOG_RIGHT_X)) > kDriverControlDeadband ||
-         master.get_digital(DIGITAL_R1) ||
-         master.get_digital(DIGITAL_R2) ||
-         master.get_digital(DIGITAL_L1) ||
-         master.get_digital(DIGITAL_L2) ||
-         master.get_digital(DIGITAL_UP) ||
-         master.get_digital(DIGITAL_DOWN) ||
-         master.get_digital(DIGITAL_LEFT) ||
-         master.get_digital(DIGITAL_RIGHT) ||
-         master.get_digital(DIGITAL_A) ||
-         master.get_digital(DIGITAL_B) ||
-         master.get_digital(DIGITAL_X) ||
-         master.get_digital(DIGITAL_Y);
+struct AutonDefinition {
+  const char* name;
+  AutonRoutine routine;
+  AutonCategory category;
+};
+
+struct HottestMotor {
+  float temperature = 0.0f;
+  char name[16] = "";
+};
+
+struct IntakeCommand {
+  int speed = 0;
+  bool selectMode = true;
+  bool topMode = false;
+};
+
+constexpr std::uint32_t kScoreMidIntakeDelayMs = 300;
+constexpr int kDriverControlDeadband = 10;
+constexpr double kDriverActiveBrake = 1.5;
+constexpr const char* kNoSdDefaultAutonName = "LTV Path";
+constexpr std::array<AutonDefinition, 13> kAutonCatalog{{
+    {"Left 7 wing", left7wing, AutonCategory::MATCH},
+    {"Left 43", left43, AutonCategory::MATCH},
+    {"Big Bertha", rightActualAWP, AutonCategory::MATCH},
+    {"Right AWP", rightAWP, AutonCategory::MATCH},
+    {"Skills", skills, AutonCategory::SKILLS},
+    {"crap skills", shitty_skills, AutonCategory::SKILLS},
+    {"Turn Test", turn_example, AutonCategory::TEST},
+    {"Odom Test", odom_drive_example, AutonCategory::TEST},
+    {"RAMSETE Move", ramsete_move_example, AutonCategory::TEST},
+    {"LTV Move", ltv_move_example, AutonCategory::TEST},
+    {"RAMSETE Path", ramsete_path_example, AutonCategory::TEST},
+    {"LTV Path", ltv_path_example, AutonCategory::TEST},
+    {"RAMSETE+PID", ramsete_with_pid_example, AutonCategory::TEST},
+}};
+
+int no_sd_default_auton_index() {
+  for (int i = 0; i < static_cast<int>(kAutonCatalog.size()); ++i) {
+    if (std::strcmp(kAutonCatalog[i].name, kNoSdDefaultAutonName) == 0) {
+      return i;
+    }
+  }
+  return 0;
 }
 
-// ── Screen task ───────────────────────────────────────────────────────────────
-static bool s_brain_ui_ready = false;
-static constexpr bool kUseEzLcdDebug = false;
-static std::atomic_bool s_practice_auton_running = false;
+void apply_no_sd_default_auton() {
+  if (ez::util::SD_CARD_ACTIVE) return;
+
+  const int count = ez::as::auton_selector.auton_count;
+  if (count <= 0) return;
+
+  int index = no_sd_default_auton_index();
+  if (index < 0 || index >= count) {
+    index = 0;
+  }
+
+  ez::as::auton_selector.last_auton_page_current = index;
+  ez::as::auton_selector.auton_page_current = index;
+}
+
+template <std::size_t N>
+void copy_text(char (&dest)[N], const char* src) {
+  std::snprintf(dest, N, "%s", src ? src : "");
+}
+
+void reset_actuators() {
+  top.set_value(false);
+  selector.set_value(true);
+  tongue.set_value(false);
+  wing.set_value(false);
+}
+
+void reset_autonomous_state() {
+  s_keep_top_after_auton = false;
+  chassis.pid_targets_reset();
+  chassis.drive_mode_set(ez::DISABLE);
+  chassis.drive_imu_reset();
+  chassis.drive_sensor_reset();
+  chassis.odom_xyt_set(0_in, 0_in, 0_deg);
+}
+
+template <typename MotorContainer>
+void scan_hottest_motor_group(HottestMotor& hottest,
+                              MotorContainer& motors,
+                              const char* prefix) {
+  int index = 0;
+  for (auto& motor : motors) {
+    const float temperature = static_cast<float>(motor.get_temperature());
+    if (temperature > hottest.temperature) {
+      hottest.temperature = temperature;
+      std::snprintf(hottest.name, sizeof(hottest.name), "%s%d", prefix, index);
+    }
+    ++index;
+  }
+}
+
+HottestMotor hottest_motor() {
+  HottestMotor hottest;
+  scan_hottest_motor_group(hottest, chassis.left_motors, "L");
+  scan_hottest_motor_group(hottest, chassis.right_motors, "R");
+
+  for (int i = 0; i < intakeMotors.size(); ++i) {
+    const float temperature = static_cast<float>(intakeMotors.get_temperature(i));
+    if (temperature > hottest.temperature) {
+      hottest.temperature = temperature;
+      copy_text(hottest.name, "Intake");
+    }
+  }
+
+  return hottest;
+}
+
+void populate_auton_selection(ScreenManager::ViewModel& vm) {
+  copy_text(vm.autonName, "None");
+  vm.autonIndex = 0;
+
+  const auto& selectorState = ez::as::auton_selector;
+  vm.autonCount = selectorState.auton_count;
+
+  if (vm.autonCount <= 0) {
+    return;
+  }
+
+  const int current = selectorState.auton_page_current;
+  if (current < 0 || current >= static_cast<int>(selectorState.Autons.size())) {
+    return;
+  }
+
+  vm.autonIndex = current;
+  copy_text(vm.autonName, selectorState.Autons[current].Name.c_str());
+}
+
+const char* competition_status(bool imu_calibrated, bool competition_connected) {
+  if (!imu_calibrated) {
+    return "IMU calibrating...";
+  }
+  if (!competition_connected) {
+    return "Practice mode";
+  }
+  return "Competition ready";
+}
+
+ScreenManager::ViewModel build_view_model() {
+  ScreenManager::ViewModel vm;
+
+  vm.odomX = static_cast<float>(chassis.odom_x_get());
+  vm.odomY = static_cast<float>(chassis.odom_y_get());
+  vm.odomTheta = static_cast<float>(chassis.odom_theta_get());
+  populate_auton_selection(vm);
+
+  vm.batteryPct = static_cast<float>(pros::battery::get_capacity());
+  vm.batteryVolts = static_cast<float>(pros::battery::get_voltage()) / 1000.0f;
+
+  const HottestMotor hottest = hottest_motor();
+  vm.motorTempMax = hottest.temperature;
+  copy_text(vm.hotMotor, hottest.name);
+
+  vm.imuCalibrated = chassis.drive_imu_calibrated();
+  vm.compConnected = pros::competition::is_connected();
+  copy_text(vm.status, competition_status(vm.imuCalibrated, vm.compConnected));
+
+  return vm;
+}
+
+bool should_render_screen() {
+  return !pros::competition::is_connected() || chassis.pid_tuner_enabled();
+}
+
+std::vector<ez::Auton> selector_autons() {
+  std::vector<ez::Auton> autons;
+  autons.reserve(kAutonCatalog.size());
+  for (const auto& auton : kAutonCatalog) {
+    autons.emplace_back(auton.name, auton.routine);
+  }
+  return autons;
+}
+
+std::vector<ScreenManager::AutonEntry> screen_autons() {
+  std::vector<ScreenManager::AutonEntry> entries;
+  entries.reserve(kAutonCatalog.size());
+  for (const auto& auton : kAutonCatalog) {
+    entries.push_back({auton.name, auton.category});
+  }
+  return entries;
+}
+
+void register_autons() {
+  ez::as::auton_selector.autons_add(selector_autons());
+  ScreenManager::setAutonEntries(screen_autons());
+}
+
+bool driver_control_started() {
+  if (std::abs(master.get_analog(ANALOG_LEFT_Y)) > kDriverControlDeadband ||
+      std::abs(master.get_analog(ANALOG_RIGHT_X)) > kDriverControlDeadband) {
+    return true;
+  }
+
+  for (auto button : {DIGITAL_R1, DIGITAL_R2, DIGITAL_L1, DIGITAL_L2,
+                      DIGITAL_UP, DIGITAL_DOWN, DIGITAL_LEFT, DIGITAL_RIGHT,
+                      DIGITAL_A, DIGITAL_B, DIGITAL_X, DIGITAL_Y}) {
+    if (master.get_digital(button)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void toggle_intake_mode(IntakeMode& current_mode,
+                        pros::controller_digital_e_t button,
+                        IntakeMode target_mode) {
+  if (master.get_digital_new_press(button)) {
+    current_mode = (current_mode == target_mode) ? IntakeMode::Off : target_mode;
+  }
+}
+
+void update_intake_mode(IntakeMode& intake_mode) {
+  toggle_intake_mode(intake_mode, DIGITAL_R2, IntakeMode::Loading);
+  toggle_intake_mode(intake_mode, DIGITAL_L2, IntakeMode::ScoreHigh);
+  toggle_intake_mode(intake_mode, DIGITAL_R1, IntakeMode::ScoreMid);
+  toggle_intake_mode(intake_mode, DIGITAL_L1, IntakeMode::ScoreLow);
+}
+
+IntakeCommand intake_command_for_mode(IntakeMode mode,
+                                      std::uint32_t score_mid_entered_ms) {
+  switch (mode) {
+    case IntakeMode::Loading:
+      return {.speed = 127, .selectMode = true, .topMode = false};
+    case IntakeMode::ScoreHigh:
+      return {.speed = 127, .selectMode = true, .topMode = true};
+    case IntakeMode::ScoreMid:
+      return {.speed = (pros::millis() - score_mid_entered_ms >= kScoreMidIntakeDelayMs) ? 127 : 0,
+              .selectMode = false,
+              .topMode = false};
+    case IntakeMode::ScoreLow:
+      return {.speed = -80, .selectMode = true, .topMode = false};
+    case IntakeMode::Off:
+    default:
+      return {};
+  }
+}
+
+void apply_intake_command(const IntakeCommand& command, bool preserve_auton_top) {
+  intakeMotors.move(command.speed);
+  selector.set_value(command.selectMode);
+  if (!preserve_auton_top) {
+    top.set_value(command.topMode);
+  }
+}
+
+}  // namespace
 
 static void screen_task_fn() {
   while (true) {
@@ -64,64 +304,8 @@ static void screen_task_fn() {
       continue;
     }
 
-    ScreenManager::ViewModel vm;
-
-    // Odom from EZ-Template
-    vm.odomX     = static_cast<float>(chassis.odom_x_get());
-    vm.odomY     = static_cast<float>(chassis.odom_y_get());
-    vm.odomTheta = static_cast<float>(chassis.odom_theta_get());
-
-    // Selector state (EZ-Template selector)
-    vm.autonName = "None";
-    vm.autonIndex = 0;
-    vm.autonCount = ez::as::auton_selector.auton_count;
-    if (vm.autonCount > 0 &&
-        ez::as::auton_selector.auton_page_current >= 0 &&
-        ez::as::auton_selector.auton_page_current < static_cast<int>(ez::as::auton_selector.Autons.size())) {
-      vm.autonIndex = ez::as::auton_selector.auton_page_current;
-      vm.autonName  = ez::as::auton_selector.Autons[vm.autonIndex].Name;
-    }
-
-    // Battery
-    vm.batteryPct   = static_cast<float>(pros::battery::get_capacity());
-    vm.batteryVolts = static_cast<float>(pros::battery::get_voltage()) / 1000.0f;
-
-    // Motor temps — find hottest drive motor
-    float maxTemp = 0.0f;
-    std::string hotName;
-    int motorIdx = 0;
-    for (auto& m : chassis.left_motors) {
-      float t = static_cast<float>(m.get_temperature());
-      if (t > maxTemp) { maxTemp = t; hotName = "L" + std::to_string(motorIdx); }
-      motorIdx++;
-    }
-    motorIdx = 0;
-    for (auto& m : chassis.right_motors) {
-      float t = static_cast<float>(m.get_temperature());
-      if (t > maxTemp) { maxTemp = t; hotName = "R" + std::to_string(motorIdx); }
-      motorIdx++;
-    }
-    // Also check intake motors
-    for (int i = 0; i < intakeMotors.size(); i++) {
-      float t = static_cast<float>(intakeMotors.get_temperature(i));
-      if (t > maxTemp) { maxTemp = t; hotName = "Intake"; }
-    }
-    vm.motorTempMax = maxTemp;
-    vm.hotMotor     = hotName;
-
-    // Status
-    vm.imuCalibrated = chassis.drive_imu_calibrated();
-    vm.compConnected = pros::competition::is_connected();
-    if (!vm.imuCalibrated) {
-      vm.status = "IMU calibrating...";
-    } else if (!vm.compConnected) {
-      vm.status = "Practice mode";
-    } else {
-      vm.status = "Competition ready";
-    }
-
-    if (!pros::competition::is_connected() || chassis.pid_tuner_enabled()) {
-      ScreenManager::render(vm);
+    if (should_render_screen()) {
+      ScreenManager::render(build_view_model());
     }
 
     pros::delay(ez::util::DELAY_TIME);
@@ -135,10 +319,7 @@ pros::Task screenTask(screen_task_fn);
 void initialize() {
   s_brain_ui_ready = false;
   s_keep_top_after_auton = false;
-  top.set_value(false);
-  selector.set_value(true);
-  tongue.set_value(false);
-  wing.set_value(false);
+  reset_actuators();
   // Show boot screen
   ScreenManager::renderBoot(0.0f, "Starting...");
   pros::delay(500);
@@ -150,58 +331,15 @@ void initialize() {
 
   // ── Chassis PID + behavior settings ───────────────────────────────────────
   chassis.opcontrol_curve_buttons_toggle(true);
-  chassis.opcontrol_drive_activebrake_set(RobotConfig::DRIVER_ACTIVE_BRAKE_POWER);
-  chassis.opcontrol_curve_default_set(RobotConfig::DRIVER_FORWARD_CURVE_T,
-                                      RobotConfig::DRIVER_TURN_CURVE_T);
+  chassis.opcontrol_drive_activebrake_set(1.5);
+  chassis.opcontrol_curve_default_set(5.0, 5.0);
 
   default_constants();
 
   // ── Auton selector init (EZ-Template) ─────────────────────────────────────
   ScreenManager::renderBoot(0.3f, "Loading autons...");
-  using Cat = ScreenManager::AutonCategory;
-  ez::as::auton_selector.autons_add({
-      // ── Match autons ──────────────────────────────────────────────────────
-      {"Left 7 wing",    left7wing},
-      {"Left 43",        left43},
-      {"Big Bertha",     rightActualAWP},
-      {"Right AWP",      rightAWP},
-      {"Red Positive",   red_positive_auton},
-      {"Red Negative",   red_negative_auton},
-      {"Blue Positive",  blue_positive_auton},
-      {"Blue Negative",  blue_negative_auton},
-      // ── Skills ────────────────────────────────────────────────────────────
-      {"Skills",         skills},
-      {"crap skills",    shitty_skills},
-      // ── Test / tuning ─────────────────────────────────────────────────────
-      {"Turn Test",      turn_example},
-      {"Odom Test",      odom_drive_example},
-      {"RAMSETE Move",   ramsete_move_example},
-      {"LTV Move",       ltv_move_example},
-      {"RAMSETE Path",   ramsete_path_example},
-      {"LTV Path",       ltv_path_example},
-      {"RAMSETE+PID",    ramsete_with_pid_example},
-  });
-
-  // Register category metadata (must match autons_add order above)
-  ScreenManager::setAutonEntries({
-      {"Left 7 wing",    Cat::MATCH},
-      {"Left 43",        Cat::MATCH},
-      {"Big Bertha",     Cat::MATCH},
-      {"Right AWP",      Cat::MATCH},
-      {"Red Positive",   Cat::MATCH},
-      {"Red Negative",   Cat::MATCH},
-      {"Blue Positive",  Cat::MATCH},
-      {"Blue Negative",  Cat::MATCH},
-      {"Skills",         Cat::SKILLS},
-      {"crap skills",    Cat::SKILLS},
-      {"Turn Test",      Cat::TEST},
-      {"Odom Test",      Cat::TEST},
-      {"RAMSETE Move",   Cat::TEST},
-      {"LTV Move",       Cat::TEST},
-      {"RAMSETE Path",   Cat::TEST},
-      {"LTV Path",       Cat::TEST},
-      {"RAMSETE+PID",    Cat::TEST},
-  });
+  register_autons();
+  apply_no_sd_default_auton();
 
   // Load EZ-Template selector state from SD without starting the default LLEMU UI.
   ez::as::auton_selector_initialize();
@@ -239,61 +377,13 @@ void competition_initialize() {
  * Autonomous.
  */
 void autonomous() {
-  s_keep_top_after_auton = false;
-  chassis.pid_targets_reset();
-  chassis.drive_imu_reset();
-  chassis.drive_sensor_reset();
-  chassis.odom_xyt_set(0_in, 0_in, 0_deg);
+  reset_autonomous_state();
   chassis.drive_brake_set(MOTOR_BRAKE_HOLD);
 
-  // Route to whichever auton EZ-Template selector chose
   ez::as::auton_selector.selected_auton_call();
   top.set_value(true);
   s_keep_top_after_auton = true;
 }
-
-/**
- * Tracker helper for ez_screen_task.
- */
-void screen_print_tracker(ez::tracking_wheel* tracker, std::string name, int line) {
-  std::string val = "", width = "";
-  if (tracker != nullptr) {
-    val   = name + " tracker: " + util::to_string_with_precision(tracker->get());
-    width = "  width: "  + util::to_string_with_precision(tracker->distance_to_center_get());
-  }
-  ez::screen_print(val + width, line);
-}
-
-/**
- * EZ-Template debug screen task — shown only when not at competition.
- */
-void ez_screen_task() {
-  while (true) {
-    if (!kUseEzLcdDebug) {
-      pros::delay(ez::util::DELAY_TIME);
-      continue;
-    }
-
-    if (!pros::competition::is_connected()) {
-      if (chassis.odom_enabled() && !chassis.pid_tuner_enabled()) {
-        if (ez::as::page_blank_is_on(0)) {
-          ez::screen_print("x: " + util::to_string_with_precision(chassis.odom_x_get()) +
-                           "\ny: " + util::to_string_with_precision(chassis.odom_y_get()) +
-                           "\na: " + util::to_string_with_precision(chassis.odom_theta_get()), 1);
-          screen_print_tracker(chassis.odom_tracker_left,  "l", 4);
-          screen_print_tracker(chassis.odom_tracker_right, "r", 5);
-          screen_print_tracker(chassis.odom_tracker_back,  "b", 6);
-          screen_print_tracker(chassis.odom_tracker_front, "f", 7);
-        }
-      }
-    } else {
-      if (ez::as::page_blank_amount() > 0)
-        ez::as::page_blank_remove_all();
-    }
-    pros::delay(ez::util::DELAY_TIME);
-  }
-}
-pros::Task ezScreenTask(ez_screen_task);
 
 /**
  * EZ-Template extras: PID tuner + run auton from opcontrol.
@@ -303,8 +393,7 @@ void ez_template_extras() {
     if (master.get_digital_new_press(DIGITAL_X))
       chassis.pid_tuner_toggle();
 
-    if (!pros::competition::is_connected() &&
-        !s_practice_auton_running.load() &&
+    if (!s_practice_auton_running.load() &&
         master.get_digital(DIGITAL_B) &&
         master.get_digital_new_press(DIGITAL_DOWN)) {
       s_practice_auton_running = true;
@@ -348,41 +437,23 @@ void opcontrol() {
       continue;
     }
 
+    const bool competitionConnected = pros::competition::is_connected();
     const bool shouldDisableActiveBrake =
-        !pros::competition::is_connected() && ScreenManager::isInfoPageActive();
+        !competitionConnected && ScreenManager::isInfoPageActive();
     if (shouldDisableActiveBrake != infoScreenBrakeDisabled) {
       infoScreenBrakeDisabled = shouldDisableActiveBrake;
       chassis.opcontrol_drive_activebrake_set(
-          infoScreenBrakeDisabled ? 0.0 : RobotConfig::DRIVER_ACTIVE_BRAKE_POWER);
+          infoScreenBrakeDisabled ? 0.0 : kDriverActiveBrake);
     }
 
-    // ── Drive mode (pick one) ──────────────────────────────────────────────
-    chassis.opcontrol_arcade_standard(ez::SPLIT);   // Split-arcade (recommended)
-    // chassis.opcontrol_arcade_standard(ez::SINGLE);
-    // chassis.opcontrol_arcade_flipped(ez::SPLIT);
-    // chassis.opcontrol_tank();
+    chassis.opcontrol_arcade_standard(ez::SPLIT);
 
     if (preserveAutonTop && driver_control_started()) {
       preserveAutonTop = false;
       s_keep_top_after_auton = false;
     }
 
-    int intakeSpeed = 0;
-    bool selectMode = true;
-    bool upMode = false;
-
-    if (master.get_digital_new_press(DIGITAL_R2)) {
-      intakeMode = (intakeMode == IntakeMode::Loading) ? IntakeMode::Off : IntakeMode::Loading;
-    }
-    if (master.get_digital_new_press(DIGITAL_L2)) {
-      intakeMode = (intakeMode == IntakeMode::ScoreHigh) ? IntakeMode::Off : IntakeMode::ScoreHigh;
-    }
-    if (master.get_digital_new_press(DIGITAL_R1)) {
-      intakeMode = (intakeMode == IntakeMode::ScoreMid) ? IntakeMode::Off : IntakeMode::ScoreMid;
-    }
-    if (master.get_digital_new_press(DIGITAL_L1)) {
-      intakeMode = (intakeMode == IntakeMode::ScoreLow) ? IntakeMode::Off : IntakeMode::ScoreLow;
-    }
+    update_intake_mode(intakeMode);
 
     if (intakeMode != previousIntakeMode) {
       if (intakeMode == IntakeMode::ScoreMid) {
@@ -391,35 +462,9 @@ void opcontrol() {
       previousIntakeMode = intakeMode;
     }
 
-    switch (intakeMode) {
-      case IntakeMode::Loading:
-        intakeSpeed = 127;
-        selectMode = true;
-        upMode = false;
-        break;
-      case IntakeMode::ScoreHigh:
-        intakeSpeed = 127;
-        selectMode = true;
-        upMode = true;
-        break;
-      case IntakeMode::ScoreMid:
-        intakeSpeed = (pros::millis() - scoreMidEnteredMs >= SCORE_MID_INTAKE_DELAY_MS) ? 127 : 0;
-        selectMode = false;
-        break;
-      case IntakeMode::ScoreLow:
-        intakeSpeed = -80;
-        break;
-      case IntakeMode::Off:
-      default:
-        intakeSpeed = 0;
-        break;
-    }
-
-    intakeMotors.move(intakeSpeed);
-    selector.set_value(selectMode);
-    if (!preserveAutonTop) {
-      top.set_value(upMode);
-    }
+    apply_intake_command(
+        intake_command_for_mode(intakeMode, scoreMidEnteredMs),
+        preserveAutonTop);
 
     if (master.get_digital_new_press(DIGITAL_B)) {
       wingState = !wingState;

@@ -19,7 +19,6 @@
  */
 #pragma once
 
-#include "robot_config.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -49,10 +48,10 @@ public:
      * @param maxVelInps   top speed in in/s     (used for normalisation)
      * @param trackWidthIn drivetrain track width in inches
      */
-    explicit RamseteController(float zeta         = RobotConfig::RAMSETE_ZETA,
-                               float beta         = RobotConfig::RAMSETE_BETA,
-                               float maxVelInps   = RobotConfig::MAX_SPEED_INPS,
-                               float trackWidthIn = RobotConfig::TRACK_WIDTH_IN)
+    explicit RamseteController(float zeta         = 0.7f,
+                               float beta         = 2.0f,
+                               float maxVelInps   = 76.576321f,
+                               float trackWidthIn = 11.338583f)
         : m_zeta(zeta), m_beta(beta),
           m_maxVelInps(maxVelInps), m_trackWidthIn(trackWidthIn) {}
 
@@ -86,13 +85,16 @@ public:
         // Gain k
         float k = 2.0f * m_zeta *
                   std::sqrt(omegaRefRad * omegaRefRad + m_beta * vRef * vRef);
+        const float sincEth = sinc(m_eth);
 
         // RAMSETE commanded velocities
         float v     = vRef        * std::cos(m_eth) + k * m_ex;
-        float omega = omegaRefRad + k * m_eth + m_beta * vRef * sinc(m_eth) * m_ey;
+        float omega = omegaRefRad + k * m_eth + m_beta * vRef * sincEth * m_ey;
 
         m_lastV     = v;
         m_lastOmega = omega;
+        m_lastK     = k;
+        m_lastSinc  = sincEth;
 
         return {v, omega};
     }
@@ -110,11 +112,14 @@ public:
     float lastEx()    const { return m_ex; }
     float lastEy()    const { return m_ey; }
     float lastEth()   const { return m_eth; }
+    float lastK()     const { return m_lastK; }
+    float lastSinc()  const { return m_lastSinc; }
 
 private:
     float m_zeta, m_beta, m_maxVelInps, m_trackWidthIn;
     float m_ex = 0, m_ey = 0, m_eth = 0;
     float m_lastV = 0, m_lastOmega = 0;
+    float m_lastK = 0, m_lastSinc = 1;
 
     DiffSpeeds toMotorCommands(float v, float omega) const {
         float tw2  = m_trackWidthIn / 2.0f;
