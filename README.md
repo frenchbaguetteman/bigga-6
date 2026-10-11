@@ -1,64 +1,67 @@
-![](https://img.shields.io/github/downloads/EZ-Robotics/EZ-Template/total.svg)
-![](https://github.com/EZ-Robotics/EZ-Template/workflows/Build/badge.svg)
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
+# Bigga 6
 
-⚡️ **coding made ez** ⚡️
+VEX V5 robot control code built on PROS and EZ-Template, with additional path-tracking controllers,
+trajectory planning, GPS startup configuration, and a custom brain-screen interface.
 
-💅 **docs and tutorials** 💅 
+This repository brings together autonomous motion, driver control, and robot-specific subsystems.
+It is a hardware project: motor ports, geometry, gains, and routines need to match the robot.
 
-💥 **pid, odometry, pure pursuit, boomerang** 💥
+## What is added here
 
-📚 **focus on consistency** 📚
+- **Path tracking:** LTV and RAMSETE controller implementations, with examples alongside EZ-Template PID motion.
+- **Trajectory references:** waypoint sampling and velocity constraints for multi-point paths.
+- **Startup pose:** configurable GPS/IMU initialization.
+- **Brain UI:** field visualization, autonomous selection, and robot status views.
+- **Robot integration:** intake and pneumatic control, autonomous routines, and driver bindings.
 
-🧐 **out of the box documentation** 🧐
+EZ-Template provides the underlying drive, PID, odometry, autonomous-selector, and competition
+infrastructure. The project-specific additions above build on that foundation.
 
-🔌 **plug and play example project** 🔌
+## Build and try it
 
-[See a complete playlist of EZ-Template autons here!](https://www.youtube.com/playlist?list=PLyZbi14KopZK70GTSD5NpygoAcM2_ls7T)
+Install the [PROS toolchain](https://pros.cs.purdue.edu/). The checked-in project targets VEX V5;
+its project metadata records PROS kernel 4.1.1 and LVGL 8.3.8.
 
-## [Discord Server](https://discord.gg/EHjXBcK2Gy)
-Need extra assistance using EZ-Template?  Feel free to join our [Discord Server](https://discord.gg/EHjXBcK2Gy)! 
+```sh
+git clone https://github.com/frenchbaguetteman/bigga-6.git
+cd bigga-6
+pros make
+```
 
-## Features
-EZ-Template is built with high attention to the user experience.
+Before uploading, review [robot_config.hpp](include/robot_config.hpp) and the chassis/subsystem
+setup in [main.cpp](src/main.cpp). Set the motor and sensor ports, wheel dimensions, gearing,
+starting pose, and gains for your hardware. Autonomous examples are in [autons.cpp](src/autons.cpp).
 
-* Built with 💜 and [PROS](https://pros.cs.purdue.edu/)
-  * Powerful open source Development platform for VEX V5 
-  * Customize and extend with other community PROS libraries
-* 🔌 Example project is plug-and-play
-  * Simple to setup
-  * Get up and running in minutes
-* 👀 Simple to use API
-  * PID for driving, turning, swing turns, and arcs
-  * Odometry with Pure Pursuit and Boomerang
-  * Asynchronous PID with blocking functions
-  * "Tug of war" detection
-  * Overheat detection and exiting
-  * Live PID tuning
-  * Tracking wheel support
-* 📺 Autonomous selector
-  * Easy to add autons
-  * SD card saving
-* 🎮 Joystick control
-  * Tank drive, single stick arcade, and dual stick arcade
-  * Joystick input curves
-  * Adjust joystick curves live through the controller
-* PID for your own subsystems
-* Slew for your own subsystems
+With a configured V5 robot connected:
 
+```sh
+pros upload
+```
 
-## Design Principles
-* **Quick to get going.**  EZ-Template should make it easy to learn and use.  Anything is achievable by users, even if it takes them more code and more time to write.  
-* **Intuitive.**  Users will not feel overwhelmed when looking at an EZ-Template project or adding new features.  It should look intuitive and easy to build on top of.  
-* **Sensible Defaults.**  Common and popular performance optimizations and configurations will be done for users, but only with the option to override them.  
+## Code map
 
-We believe that, as developers, knowing how a library works helps us become better at using it.  We're dedicating effort to creating tutorials and documentation with the hope that reading it will gain the user a deeper understanding of the tool, and become even more proficient in using it.  
+| Area | Location |
+| --- | --- |
+| Robot geometry, ports, and configuration | [include/robot_config.hpp](include/robot_config.hpp) |
+| LTV and RAMSETE controllers | [include/controllers](include/controllers) |
+| Trajectory reference planner | [include/pathing/reference_planner.hpp](include/pathing/reference_planner.hpp) |
+| GPS startup pose | [include/localization/gps_init.hpp](include/localization/gps_init.hpp) |
+| Competition entry points and driver control | [src/main.cpp](src/main.cpp) |
+| Autonomous routines and motion examples | [src/autons.cpp](src/autons.cpp) |
+| Brain-screen interface | [src/ui](src/ui) |
+| Path assets | [sd-card](sd-card) |
 
-## [Support me on Patreon!](https://www.patreon.com/roboticsisez)
-Supporting me on Patreon will help guarantee that EZ-Template continues to get maintained and allow me to develop products for teams to use.  [Click here](https://www.patreon.com/roboticsisez) to see my Patreon!
+## Current scope
 
-## [Download and Installation](https://ez-robotics.github.io/EZ-Template/tutorials/installation)
-Learn how to install and setup EZ-Template [here](https://ez-robotics.github.io/EZ-Template/tutorials/installation)!
+This version contains robot-side code; host tests and a simulator are not included.
+Controller implementations and examples are not a substitute for tuning and measuring performance
+on the actual robot. No tracking-accuracy benchmark is published here yet.
 
-## [License](https://opensource.org/licenses/MPL-2.0)
-This project is licensed under the Mozilla Public License, version 2.0 - see the [LICENSE](https://opensource.org/licenses/MPL-2.0) file for the full license.
+## Credits and license
+
+Built with [PROS](https://pros.cs.purdue.edu/) and
+[EZ-Template](https://github.com/EZ-Robotics/EZ-Template).
+For upstream API documentation and tutorials, see the
+[EZ-Template documentation](https://ez-robotics.github.io/EZ-Template/).
+
+See [LICENSE.md](LICENSE.md) for the Mozilla Public License 2.0 and retain upstream notices.
